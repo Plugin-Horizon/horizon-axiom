@@ -1,0 +1,133 @@
+[mod]
+id = "axiom"
+version = "0.1.0"
+priority = 100
+
+# Written blind against this Horizon commit (2026-11-09): not built yet. Uses named hook points from
+# native-hooks.json where one exists; `native_custom_payload_from_client` and `native_player_logging_out` have
+# no named hook there, so they are bound by their full path (as the floodgate bundle does for the payload).
+[compatibility]
+horizon_revision = "92fd45976d1d66b639a9556d54aae66c7e7b69c2"
+
+# The protocol core: codecs, block buffers, restrictions, operations. No Horizon types.
+[[crate]]
+id = "core"
+path = "core"
+dependent = "horizon-client-lib"
+
+# `horizon_client::axiom::core`: the core re-exported (as worldedit does for its editor).
+[[module]]
+id = "lib"
+file = "crates/horizon-client/src/client_lib.rs"
+name = "axiom"
+source = "lib_module.rs"
+visibility = "pub"
+
+# The game side: the level in place, the players, permissions, the network, the tick queue.
+[[module]]
+id = "glue"
+file = "crates/horizon-client/src/game.rs"
+name = "axiom"
+source = "glue.rs"
+
+# A client's `axiom:*` payload (`axiom:tunnel`, `axiom:hello`, ...). Vanilla drops these channels, so Horizon hears
+# them here. The hook has no game in hand: the payload is queued and answered in the next server tick.
+[[injection]]
+id = "payload"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_custom_payload_from_client"
+helper = "helpers/payload.rs"
+bindings = [
+  { name = "player", ty = "u128", value = "player" },
+  { name = "channel", ty = "&str", value = "channel" },
+  { name = "data", ty = "&[u8]", value = "data" },
+]
+
+# Each server tick's start: the queued payloads are answered, in the order they came.
+[[injection]]
+id = "tick"
+hook = "server_tick"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "phase", ty = "horizon_client::mod_api::ServerTickPhase", value = "phase" },
+]
+
+# A player placed in the world: queued, the restrictions state takes it up in the tick.
+[[injection]]
+id = "logged-in"
+hook = "player_logged_in"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/logged_in.rs"
+bindings = [
+  { name = "player", ty = "u128", value = "player" },
+]
+
+# A player who leaves (any path): queued, the restrictions state drops them in the tick.
+[[injection]]
+id = "logged-out"
+hook = "player_logged_out"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/logged_out.rs"
+bindings = [
+  { name = "player", ty = "u128", value = "player" },
+]
+
+# /axiompaperdebug (operators, axiom.all, axiom.debug) and /axiompapermigrateconfig.
+[[injection]]
+id = "register-commands"
+hook = "register_commands"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/register.rs"
+bindings = [
+  { name = "commands", ty = "&mut Vec<crate::game::native_server::NativeCommand>", value = "&mut *commands" },
+]
+
+[[injection]]
+id = "perform-command"
+hook = "perform_command"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/perform.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "&crate::game::native_server::NativeServerPlayer", value = "player" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "&mut *ran" },
+]
+
+# config/axiom-server.toml: registered as a Server config (read with the world's own when it opens).
+[[injection]]
+id = "register-config"
+hook = "register_configs"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/register_config.rs"
+bindings = [
+  { name = "configs", ty = "&mut Vec<crate::game::native_configs::NativeConfig>", value = "&mut *configs" },
+]
+
+[[injection]]
+id = "config-loading"
+hook = "config_loading"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/config_loading.rs"
+bindings = [
+  { name = "file", ty = "&crate::game::native_configs::NativeConfigFile", value = "config" },
+]
+
+[[injection]]
+id = "config-reloading"
+hook = "config_reloading"
+hook_version = 1
+kind = "HEAD"
+helper = "helpers/config_reloading.rs"
+bindings = [
+  { name = "file", ty = "&crate::game::native_configs::NativeConfigFile", value = "config" },
+]
