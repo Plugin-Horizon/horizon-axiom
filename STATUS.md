@@ -5,7 +5,7 @@ Built and running on a Horizon server (26.3) with clients of every release from 
 ## Engine requirement
 
 The glue calls `native_ack_block_changes(player, sequence)` (vanilla `ClientboundBlockChangedAckPacket`), which
-upstream Horizon does not have yet (GAPS.md, "Block change acknowledgement"). Until it lands, the bundle builds only
+upstream Horizon does not have yet (open as horizon-rust/horizon#14281; GAPS.md, "Block change acknowledgement"). Until it lands, the bundle builds only
 against an engine that adds it.
 
 ## What works
