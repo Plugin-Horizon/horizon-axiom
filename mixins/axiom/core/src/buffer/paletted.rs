@@ -3,11 +3,13 @@
 // (VersionHelper.createPalettedContainer / PalettedContainer.read). Native protocol only;
 // the ViaVersion translation path (UnknownVersionHelper) is not ported.
 //
-// Wire layout of one 16^3 section:
+// Wire layout of one 16^3 section (vanilla since 1.21.5, protocol 770, `writeFixedSizeLongArray`):
 //   u8 bits-per-entry
-//   bits 0:    varint single value, then varint data-length (always 0)
-//   bits 4..=8: varint palette length, varint palette ids, varint data-length, longs
-//   bits >= 9: varint data-length, longs (global ids, bit count = global_bits)
+//   bits 0:    varint single value (no longs)
+//   bits 4..=8: varint palette length, varint palette ids, longs
+//   bits >= 9: longs (global ids, bit count = global_bits)
+// Releases before 1.21.5 put a varint long count before the longs ([`LongArrays::Counted`]): a client the
+// server's protocol adapter translates (Java: ViaVersion's `PALETTE_TYPE_1_18`).
 // Entries are packed without crossing 64-bit boundaries: floor(64 / bits) per long.
 // Cell index = y*256 + z*16 + x.
 
@@ -37,11 +39,30 @@ fn read_palette_id(r: &mut Reader) -> Result<u32, BufferError> {
     u32::try_from(v).map_err(|_| BufferError::NegativeValue(v))
 }
 
-/// Reads the data array: varint length, then the longs. The length must match `expected`.
-fn read_storage(r: &mut Reader, expected: usize) -> Result<Vec<u64>, BufferError> {
-    let found = r.read_varint()?;
-    if found < 0 || found as usize != expected {
-        return Err(BufferError::StorageLengthMismatch { expected, found });
+/// How a section's longs are framed on the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LongArrays {
+    /// 1.21.5 (protocol 770) and later: exactly as many longs as the bit count needs, no count.
+    #[default]
+    Fixed,
+    /// Before 1.21.5: a varint long count, then the longs.
+    Counted,
+}
+
+impl LongArrays {
+    /// The framing a client on `protocol` uses (Java `ViaVersionHelper.getPalettedContainerType`).
+    pub fn for_protocol(protocol: i32) -> Self {
+        if protocol >= 770 { Self::Fixed } else { Self::Counted }
+    }
+}
+
+/// Reads the data array: the longs, after a varint count that must match `expected` if `framing` has one.
+fn read_storage(r: &mut Reader, expected: usize, framing: LongArrays) -> Result<Vec<u64>, BufferError> {
+    if framing == LongArrays::Counted {
+        let found = r.read_varint()?;
+        if found < 0 || found as usize != expected {
+            return Err(BufferError::StorageLengthMismatch { expected, found });
+        }
     }
     let mut longs = Vec::with_capacity(expected);
     for _ in 0..expected {
@@ -73,7 +94,7 @@ fn pack(values: impl Iterator<Item = u64>, bits: u8) -> Vec<i64> {
 }
 
 /// Reads one paletted section and returns it dense.
-pub(super) fn read_section(r: &mut Reader, global_bits: u8) -> Result<Box<Section>, BufferError> {
+pub(super) fn read_section(r: &mut Reader, global_bits: u8, framing: LongArrays) -> Result<Box<Section>, BufferError> {
     let bits = super::read_i8(r)?;
     if bits < 0 {
         return Err(BufferError::InvalidBitsPerEntry(bits));
@@ -83,7 +104,7 @@ pub(super) fn read_section(r: &mut Reader, global_bits: u8) -> Result<Box<Sectio
 
     if bits == 0 {
         let value = read_palette_id(r)?;
-        read_storage(r, 0)?;
+        read_storage(r, 0, framing)?;
         out.fill(value);
     } else if bits <= MAX_INDIRECT_BITS {
         // Vanilla pads small entry sizes up to the minimum indirect size.
@@ -97,7 +118,7 @@ pub(super) fn read_section(r: &mut Reader, global_bits: u8) -> Result<Box<Sectio
         for _ in 0..len {
             palette.push(read_palette_id(r)?);
         }
-        let longs = read_storage(r, storage_len(bits))?;
+        let longs = read_storage(r, storage_len(bits), framing)?;
         for (i, cell) in out.iter_mut().enumerate() {
             let index = unpack(&longs, bits, i);
             *cell = *palette.get(index).ok_or(BufferError::PaletteIndexOutOfRange {
@@ -108,7 +129,7 @@ pub(super) fn read_section(r: &mut Reader, global_bits: u8) -> Result<Box<Sectio
     } else {
         // Like vanilla, entries above 8 bits always use the global palette bit count.
         check_global_bits(global_bits)?;
-        let longs = read_storage(r, storage_len(global_bits))?;
+        let longs = read_storage(r, storage_len(global_bits), framing)?;
         for (i, cell) in out.iter_mut().enumerate() {
             *cell = unpack(&longs, global_bits, i) as u32;
         }
@@ -122,10 +143,9 @@ pub(super) fn write_section(w: &mut Writer, data: &Section, global_bits: u8) -> 
     let distinct: HashSet<u32> = data.iter().copied().collect();
 
     if distinct.len() == 1 {
-        // Single-value form: bits byte 0, palette value, data length 0.
+        // Single-value form: bits byte 0, palette value, no longs.
         w.write_bytes(&[0]);
         write_palette_id(w, data[0])?;
-        w.write_varint(0);
         return Ok(());
     }
 
@@ -168,8 +188,8 @@ fn write_palette_id(w: &mut Writer, v: u32) -> Result<(), BufferError> {
     Ok(())
 }
 
+/// The longs as vanilla 1.21.5+ writes them (`writeFixedSizeLongArray`, no count).
 fn write_longs(w: &mut Writer, longs: &[i64]) {
-    w.write_varint(longs.len() as i32);
     for &l in longs {
         w.write_i64(l);
     }
@@ -193,7 +213,7 @@ mod tests {
         write_section(&mut w, data, global_bits).unwrap();
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
-        let back = read_section(&mut r, global_bits).unwrap();
+        let back = read_section(&mut r, global_bits, LongArrays::Fixed).unwrap();
         assert_eq!(r.remaining(), 0, "section must consume exactly its bytes");
         back
     }
@@ -236,8 +256,8 @@ mod tests {
         let data = [5u32; SECTION_VOLUME];
         let mut w = Writer::new();
         write_section(&mut w, &data, 15).unwrap();
-        // bits 0, palette value 5, data length 0
-        assert_eq!(w.into_bytes(), vec![0u8, 5, 0]);
+        // bits 0, palette value 5, no longs
+        assert_eq!(w.into_bytes(), vec![0u8, 5]);
     }
 
     #[test]
@@ -266,7 +286,7 @@ mod tests {
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
         assert!(matches!(
-            read_section(&mut r, 15),
+            read_section(&mut r, 15, LongArrays::Fixed),
             Err(BufferError::PaletteIndexOutOfRange { index: 1, len: 1 })
         ));
     }
@@ -280,16 +300,76 @@ mod tests {
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
         assert!(matches!(
-            read_section(&mut r, 15),
+            read_section(&mut r, 15, LongArrays::Counted),
             Err(BufferError::StorageLengthMismatch { expected: 0, found: 1 })
         ));
+    }
+
+    #[test]
+    fn an_older_clients_counted_longs_read_like_the_fixed_ones() {
+        let mut data = [0u32; SECTION_VOLUME];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = (i % 3) as u32 * 100;
+        }
+        let mut w = Writer::new();
+        write_section(&mut w, &data, 15).unwrap();
+        let fixed = w.into_bytes();
+        // the same section with the long count a pre-1.21.5 client puts after the palette:
+        // bits, palette length 3, ids 0 / 100 / 200 (200 takes two varint bytes) = 6 bytes, then varint 256
+        assert_eq!(&fixed[..6], &[4, 3, 0, 100, 0xC8, 0x01]);
+        let mut counted = fixed[..6].to_vec();
+        counted.extend_from_slice(&[0x80, 0x02]);
+        counted.extend_from_slice(&fixed[6..]);
+        let back = read_section(&mut Reader::new(&counted), 15, LongArrays::Counted).unwrap();
+        assert_eq!(*back, data);
+        assert!(read_section(&mut Reader::new(&fixed), 15, LongArrays::Counted).is_err());
+    }
+
+    /// The cases of `tests/fixtures/vanilla_26_3/` (written by vanilla 26.3's `PalettedContainer.write` over a
+    /// 30000-entry id map, so 15 global bits; the generator is in the fixture folder's README).
+    fn vanilla_cases() -> Vec<(&'static str, fn(usize) -> u32)> {
+        vec![
+            ("single", |_| 7),
+            ("three", |i| (i % 3) as u32 * 100),
+            ("seventeen", |i| 100 + (i % 17) as u32),
+            ("distinct255", |i| (i % 255) as u32),
+            ("global300", |i| 1000 + (i % 300) as u32),
+            ("global_all", |i| (i * 7 % 20000) as u32),
+        ]
+    }
+
+    #[test]
+    fn reads_the_sections_vanilla_26_3_writes() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vanilla_26_3");
+        for (name, f) in vanilla_cases() {
+            let bytes = std::fs::read(dir.join(format!("{name}.bin"))).unwrap();
+            let mut r = Reader::new(&bytes);
+            let back = read_section(&mut r, 15, LongArrays::Fixed).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(r.remaining(), 0, "{name}: every byte read");
+            assert!((0..SECTION_VOLUME).all(|i| back[i] == f(i)), "{name}: values");
+        }
+    }
+
+    /// With `AXIOM_WRITE_SECTIONS=<dir>`, writes the same cases for vanilla to read back (README).
+    #[test]
+    fn write_sections_for_vanilla() {
+        let Some(dir) = std::env::var_os("AXIOM_WRITE_SECTIONS") else { return };
+        for (name, f) in vanilla_cases() {
+            let mut data = [0u32; SECTION_VOLUME];
+            for (i, v) in data.iter_mut().enumerate() {
+                *v = f(i);
+            }
+            let mut w = Writer::new();
+            write_section(&mut w, &data, 15).unwrap();
+            std::fs::write(std::path::Path::new(&dir).join(format!("{name}.bin")), w.into_bytes()).unwrap();
+        }
     }
 
     #[test]
     fn negative_bits_is_an_error() {
         let bytes = [0x80u8];
         let mut r = Reader::new(&bytes);
-        assert!(matches!(read_section(&mut r, 15), Err(BufferError::InvalidBitsPerEntry(-128))));
+        assert!(matches!(read_section(&mut r, 15, LongArrays::Fixed), Err(BufferError::InvalidBitsPerEntry(-128))));
     }
 
     #[test]

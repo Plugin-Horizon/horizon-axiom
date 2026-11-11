@@ -89,6 +89,9 @@ pub trait RequestHost {
     fn block_state_global_bits(&self) -> u8;
     /// Starts loading a chunk if needed. Idempotent, may complete later.
     fn request_chunk(&mut self, dimension: &str, chunk_x: i32, chunk_z: i32);
+    /// Lets go of the hold `request_chunk` took, once the chunk is read or the request ends (also when the player
+    /// leaves with chunks in flight). Called once per chunk requested.
+    fn release_chunk(&mut self, dimension: &str, chunk_x: i32, chunk_z: i32);
     /// The chunk is loaded and at full status.
     fn is_chunk_ready(&self, dimension: &str, chunk_x: i32, chunk_z: i32) -> bool;
     /// State of one section (`sy` is the section y, not the block y).
@@ -355,6 +358,10 @@ impl RequestChunksOperation {
             return;
         }
         if !host.is_player_online(self.player) {
+            for chunk_key in self.in_flight.drain(..) {
+                let (chunk_x, chunk_z) = unpack_chunk_pos(chunk_key);
+                host.release_chunk(&self.dimension, chunk_x, chunk_z);
+            }
             self.finished = true;
             return;
         }
@@ -376,6 +383,7 @@ impl RequestChunksOperation {
             }
             self.in_flight.pop_front();
             self.process_chunk(host, chunk_key, chunk_x, chunk_z);
+            host.release_chunk(&self.dimension, chunk_x, chunk_z);
         }
 
         if !self.to_submit.is_empty() {
@@ -618,6 +626,7 @@ mod tests {
         fn request_chunk(&mut self, _: &str, cx: i32, cz: i32) {
             self.requested.push((cx, cz));
         }
+        fn release_chunk(&mut self, _: &str, _cx: i32, _cz: i32) {}
         fn is_chunk_ready(&self, _: &str, cx: i32, cz: i32) -> bool {
             self.ready.contains(&(cx, cz))
         }

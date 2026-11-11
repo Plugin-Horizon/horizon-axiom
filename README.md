@@ -6,7 +6,8 @@ Unofficial Rust port of the server side of [Axiom](https://axiom.moulberry.com/)
 Axiom's licensing and whitelist are untouched: the server plugin contains no license check, and this port adds or
 removes none. Commercial use of Axiom needs Axiom's Commercial License: https://axiomdocs.moulberry.com/other/commerciallicense.html
 
-**Status: written blind.** Not built against the engine yet. See STATUS.md and GAPS.md.
+**Status:** built and running on Horizon 26.3, with clients from 1.20.5 to 26.3. Needs one engine function upstream
+does not have yet; see STATUS.md and GAPS.md.
 
 ## Third-party data
 

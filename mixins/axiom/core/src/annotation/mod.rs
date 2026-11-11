@@ -102,10 +102,10 @@ pub trait AnnotationHost {
     /// Marker entities in the dimension, excluding markers the host hides from Axiom
     /// (`ImplAxiomHiddenEntities.isMarkerHidden`). Java scans every entity of the level, not only the
     /// ones near players.
-    fn markers(&self, dim: &str) -> Vec<MarkerEntity>;
+    fn markers(&mut self, dim: &str) -> Vec<MarkerEntity>;
     /// Custom data of the Marker entity with this uuid, an empty compound if it has none.
     /// `None` if there is no marker with that uuid.
-    fn marker_custom_data(&self, dim: &str, uuid: u128) -> Option<Nbt>;
+    fn marker_custom_data(&mut self, dim: &str, uuid: u128) -> Option<Nbt>;
     /// Sends a plugin-channel payload to one player.
     fn send_payload(&mut self, player: u128, channel: &str, data: Vec<u8>);
 
@@ -501,10 +501,10 @@ mod tests {
         fn can_modify_world(&self, _player: u128, _dim: &str) -> bool {
             self.modifiable
         }
-        fn markers(&self, _dim: &str) -> Vec<MarkerEntity> {
+        fn markers(&mut self, _dim: &str) -> Vec<MarkerEntity> {
             self.markers.clone()
         }
-        fn marker_custom_data(&self, _dim: &str, uuid: u128) -> Option<Nbt> {
+        fn marker_custom_data(&mut self, _dim: &str, uuid: u128) -> Option<Nbt> {
             self.markers.iter().find(|m| m.uuid == uuid).map(|m| m.data.clone())
         }
         fn send_payload(&mut self, player: u128, channel: &str, data: Vec<u8>) {

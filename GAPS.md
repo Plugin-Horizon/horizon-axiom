@@ -1,47 +1,12 @@
 # GAPS: what Horizon must add or change for Axiom to work fully
 
 Checked against the Horizon source at `92fd45976` and the Java reference
-(AxiomPaperPlugin, `src/main/java/com/moulberry/axiom/`). Blind: nothing here has been built or run against a server.
+(AxiomPaperPlugin, `src/main/java/com/moulberry/axiom/`). Blind: nothing here has been run against a server. The core is tested (`cargo test`); the glue was type-checked (`cargo check`) in a staged copy of upstream/main 216eca2f5 (the pinned revision in horizon-mixin.toml is older), with nothing run.
 Items marked "not verified" were not read to the end.
 
 Each bullet: what is missing, the Axiom feature that needs it, and the engine function or hook it would look like.
 
 ## Missing: the engine has no function for it
-
-- **Set the time of day.** Needed by Axiom's `set_world_time` packet (`SetTimePacketListener`, `AxiomTimeChangeEvent`).
-  Horizon has the readers `native_day_time` and `native_level_day_time`, and the cancellable `native_time_skip`, but no
-  setter. Shape: `native_set_day_time(&mut self, dimension: &str, ticks: i64, cause: &str) -> bool`, going through the
-  path `/time set` takes, so `native_time_skip` still hears it. The port's `WorldHost::set_day_time` logs once and changes nothing.
-
-- **Write biomes.** Needed by `BiomeBuffer` and the biome branch of `set_buffer` (`SetBlockBufferPacketListener`).
-  `native_biome` only reads; biomes are written in worldgen only (`set_biomes` in horizon-world). Shape:
-  `native_set_biomes(&mut self, dimension: &str, cells: &[([i32; 3], &str)]) -> Result<u64, String>` in quart
-  coordinates, which writes the cells and sends the chunk whole, as `edit_blocks` does for blocks. The port has no biome write yet
-  (`set_biome` returns false).
-
-- **Region and plot build check.** Needed by every Axiom edit and entity change: Axiom asks WorldGuard and PlotSquared
-  whether the player may build there (`SectionPermissionChecker`, `integration/worldguard`, `integration/plotsquared`).
-  Horizon has no hook for it: `native_block_place` covers placement only, `native_left_click_block` the start of a
-  dig, and `native_edit_blocks` has no player and no cancel. Shape: `native_can_build(player: u128, dimension: &str,
-  pos: [i32; 3]) -> bool`, answered by mods the way `native_permission_check` is, and asked by every bulk path with the
-  acting player. The port stubs it as `false`, which denies every edit until a region provider answers.
-
-- **Cancel a physical trigger (NoPhysicalTrigger).** Needed by `SetNoPhysicalTrigger` and `NoPhysicalTriggerListener`
-  (pressure plates, tripwire, turtle eggs stepped on while a builder edits). `native_block_step_on` reports entities
-  and cannot cancel; `native_trample` cancels but only for farmland. Shape: a cancellable
-  `native_block_physical_trigger(&mut self, player: u128, dimension: &str, pos: [i32; 3], state: BlockStateId,
-  cancel: &mut bool)` on the player's step, mirroring Bukkit's `PlayerInteractEvent.Action.PHYSICAL`.
-
-- **Game rule and weather setters.** Needed by the world properties Axiom sends (`SetWorldPropertyListener`,
-  `world_properties`). Readers exist (`native_level_game_rule`, `native_level_weather`); no setter was found. Shape:
-  `native_set_game_rule(&mut self, dimension: &str, rule: &str, value: &str) -> bool` and
-  `native_set_weather(&mut self, dimension: &str, raining: bool, thundering: bool) -> bool`.
-
-- **Block entity NBT in bulk.** Needed by `set_buffer` with `allowNbt` (compressed block entities in
-  `BlockBuffer`). `edit_blocks` refuses block NBT ("block NBT is not supported here"), and `native_set_block_tag`
-  writes one block at a time, outside the run. Shape: a `nbt: Option<Compound>` per run entry in `NativeBlockEdit`,
-  written in the same pass and given to `replace_block_entities`. Without it the port falls back to `set_block`
-  plus `set_block_entity` per block, which is slow and not atomic.
 
 - **Actor on bulk block changes (CoreProtect logging).** Needed for `log-core-protect-changes` (default true) and the
   CoreProtect integration. `native_block_changed` has no actor, and bulk edits skip per-block hooks (`block_edits.rs`:
@@ -53,11 +18,6 @@ Each bullet: what is missing, the Axiom feature that needs it, and the engine fu
   `AxiomRemoveEntityEvent` and `AxiomManipulateEntityEvent`, which other plugins use to veto. `native_summon`,
   `native_remove_entity` and `native_entity_merge_nbt` have no cancel. Shape: a `cancel: &mut bool` on each, through a
   listen-and-cancel hook. Only needed when a region or anti-grief plugin must veto Axiom's entity work.
-
-- **Writable mod data folder.** Needed by blueprint storage (`ServerBlueprintManager`, `BlueprintIo`), which keeps
-  blueprints beside the server data, not in the world. Horizon has `native_world_dir` (inside the world: reset with
-  it, backed up with it) and `native_data` (read-only, from the mod's resources). Shape:
-  `native_mod_data_dir(&self, mod_id: &str) -> Option<PathBuf>`, writable and kept across world resets.
 
 - **Custom blocks and items at runtime.** Needed by `AxiomCustomBlocksAPI` and the `register_custom_block_v2`,
   `register_custom_items` and `custom_blocks` channels. Horizon's `native_blocks` and `native_items` are startup
@@ -71,15 +31,10 @@ Each bullet: what is missing, the Axiom feature that needs it, and the engine fu
   dropped items, armour stands and item frames), and the docs say displays, markers and interactions are kept without
   simulation (`native_entities.rs`). Shape: extend the reload set in `native_entity_merge_nbt` to those kinds.
   Not verified: that `native_summon` accepts `minecraft:marker` and `minecraft:interaction` by kind.
-  Also missing: a call that lists the markers of a dimension for `WorldHost::marker_snapshot` (the port returns none).
-
-- **Chunk loading for far edits, with release.** Needed by Axiom's `RequestChunksOperation` and
-  `max-chunk-load-distance`, which load chunks a player's edit reaches. `native_force_chunk_in(owner, dimension, chunk,
-  hold)` (`native_chunk_tickets.rs`, API 413) holds a chunk with a ticket and loads it; `native_edit_blocks` skips
-  unloaded chunks. Missing: a release per request (the tickets are held until the owner lets go, and Axiom asks per
-  chunk) and a "is loaded" answer that does not load. Shape: the port's `WorldHost::request_*` calls use
-  `native_force_chunk_in` with an owner per player; the engine should also offer `native_chunk_loaded(dimension, chunk)
-  -> bool`, which `native_chunk_snapshot(...).is_some()` only approximates.
+  Marker listing is wired: `native_level_markers` (`native_npcs.rs`) feeds `WorldHost::marker_snapshot`,
+  `AnnotationHost::markers` and `marker_custom_data`. Open: only the level in place. A marker's uuid comes from
+  `native_entity(id)`, which maps ids in the level in place only, so markers of another loaded level are not listed.
+  Those traits took `&mut self` for this (core `annotation/mod.rs`, `world/mod.rs`).
 
 - **Entity data by numeric id in any loaded level.** Needed by `RequestEntityDataPacketListener` and
   `MarkerNbtRequestPacketListener`. `native_entity_nbt` takes an `EntityRef`, and `native_entity_by_uuid` covers
@@ -89,6 +44,9 @@ Each bullet: what is missing, the Axiom feature that needs it, and the engine fu
 - **Light and send budgets per tick.** Needed by `max-chunk-relights-per-tick` and `max-chunk-sends-per-tick`.
   `edit_blocks` relights the chunk and its neighbours whole at the end of the tick and sends whole chunks, with no cap.
   Shape: a `max_chunks_per_tick: Option<u32>` on `NativeBlockEdit`, the rest deferred to the next tick.
+  Wired already (no cap): `relight_chunks` and `light_chunk` call `native_relight_chunks`, `send_chunk_with_light`
+  calls `native_resend_chunk` per player, `players_tracking_chunk` calls `native_chunk_trackers`. Not wired on
+  purpose: `check_block_light`, since `native_set_block` (`Level.setBlock`) lights each write already.
 
 - **Section export for chunk requests.** Needed by `RequestChunkDataPacketListener` and `RequestChunksOperation`, which
   send palette and biome per section. `native_chunk_snapshot` gives one block state or noise biome per position.
@@ -118,17 +76,14 @@ Each bullet: what is missing, the Axiom feature that needs it, and the engine fu
 
 ## Added by the glue wiring (2026-11-09, blind; the stubs in mixins/axiom/glue.rs)
 
-- **Entity spawn with the client's uuid.** Needed by `SpawnEntityPacketListener` (`load_entity_tree`,
-  `add_fresh_entity_with_passengers`): Axiom names the new entity with its own uuid, and the engine assigns its own.
-  `native_summon(dimension, kind, pos, nbt) -> Option<u32>` takes no uuid and returns no uuid. Shape: `native_summon`
-  takes the uuid (or honours `UUID` in the NBT) and returns it with the id. Until then spawn is a no-op.
-
-- **Riding, passengers and hanging entities.** Needed by `ManipulateEntityPacketListener` (mounts, `eject_passengers`,
-  `start_riding`, `stop_riding`, `vehicle`, `passengers`) and by hanging entities (`set_hanging_turn`,
-  `adjust_item_frame_rotation`, `item_frame_on_y_axis`). No engine call for riding or for the orientation of a frame
-  was found in `native_entities.rs` / `native_entity_moves.rs`. Shape: `native_mount(vehicle, passenger)`,
-  `native_dismount(passenger)`, `native_passengers(entity)`, and `native_set_hanging_facing(entity, facing)`.
-
+- **Riding, passengers and hanging entities.** Riding in `ManipulateEntity` is wired: `start_riding` calls `native_mount`,
+  `stop_riding` `native_dismount`, `eject_passengers` `native_eject_passengers` (`native_travel.rs`). Still open:
+  `vehicle`, `passengers` and `is_passenger` have no engine getter, so the core's `remove_passenger` never reaches
+  `stop_riding` (it asks `vehicle` first) and the seat checks see nobody riding. Shape: `native_vehicle_of(id) -> Option<u32>`
+  and `native_riders_of(id) -> Vec<u32>`. `native_mount` seats only what the engine counts as riders and vehicles (players,
+  mobs, boats, minecarts), so a passenger of another kind is refused and logged. Hanging entities: `set_hanging_turn`,
+  `adjust_item_frame_rotation` and `item_frame_on_y_axis` are still stubs. Shape: `native_set_hanging_facing(entity, facing)`
+  and a facing query.
 - **Block-state properties.** Needed by the `SetBlockHost` queries and writes: block entity type per state
   (`has_block_entity`, `block_entity_type_of`, `block_entity_accepts`), neighbour shape updates
   (`update_from_neighbour_shapes`), scheduled fluid and block ticks (`tick_fluid`, `tick_block`), point-of-interest
@@ -139,7 +94,9 @@ Each bullet: what is missing, the Axiom feature that needs it, and the engine fu
 
 - **Block change acknowledgement.** Needed by `SetBlockPacketListener` (`ackBlockChangesUpTo`): the client waits for
   the server to acknowledge its predicted block changes by sequence number. No engine call sends that ack.
-  Shape: `native_ack_block_changes(player, seq: i32)` writing the vanilla `ClientboundBlockChangedAckPacket`.
+  Shape: `native_ack_block_changes(&mut self, player: u128, sequence: i32)` writing the vanilla
+  `ClientboundBlockChangedAckPacket`. **Call site:** `AxiomHost::ack_block_changes` in `mixins/axiom/glue.rs`. Upstream Horizon
+  does not have the function yet, so the glue builds only against an engine that adds it. Every Axiom edit needs it.
 
 - **Zstd (resolved).** Blueprint block entities (`BlueprintHost::compress_block_entity` /
   `decompress_block_entity`) and the tunnel's `TUNNEL_PACKET_FLAG_ZSTD_COMPRESSED` use `buffer::zstd_compress` and
@@ -148,17 +105,71 @@ Each bullet: what is missing, the Axiom feature that needs it, and the engine fu
   any more. Java decodes the tunnel without a dictionary, so the same `zstd_decompress` reads those frames. Untested
   against a live Axiom client.
 
-- **World whitelist and blacklist.** Needed by `world_allowed_by_config` and `can_modify_world` (`whitelist-world-regex`,
-  `blacklist-world-regex` in the config). Fails closed: a configured filter refuses every world. Shape: the regex matcher below.
+- **Entity uuid lookup.** Needed by every entity packet, by uuid. `native_entity_by_uuid(uuid)` now exists
+  (`native_npcs.rs`, every loaded level, `-> Option<(dimension, id, kind)>`), but it takes `&mut self`, and the core's
+  entity lookups (`has_entity`, `is_removed`, `entity_info`, `position`, ...) take `&self`. So the port still scans
+  `native_entities_in` per call (`index_dimension`, O(entities in the level)). Open: a `&self` variant of
+  `native_entity_by_uuid`, or a core change to `&mut self` on those lookups.
 
-- **Regex matcher.** Needed by `RestrictionsHost::matches_regex` (Java `String.matches`, the whole text). The `regex` crate
-  is not in Horizon's Cargo.lock, so no matcher is wired. Shape: a full-match helper in the engine or an approved crate.
+## Resolved (engine functions now used by the glue)
 
-- **Debug text of the restrictions.** Needed by `/axiompaperdebug` (`DebugHost::restrictions`). The per-player restrictions
-  are held by the core state, which the host cannot read while the state is borrowed. Shape: a core accessor the glue can call
-  before the host is built (a snapshot of the text per player), or a core change that passes the state in.
+- **Set the time of day.** `native_level_set_day_time` (`native_level_world.rs`), through `native_level`. It sets the
+  overworld clock whatever the dimension, as the engine does.
+- **Game rule and weather setters.** `native_level_set_game_rule` (`advance_time` for time frozen, `advance_weather`
+  for weather paused) and `native_level_set_weather` (`native_level_world.rs`). `weather_paused` reads `advance_weather`
+  through `native_level_game_rule`.
+- **Write biomes.** `native_set_biomes` (`native_biome_colors/native_biome_edit.rs`), one call per cell, since the core
+  writes biomes cell by cell. Each call resends its columns, so a large biome buffer is slow. Batching needs a core
+  change. An unknown biome id is refused by the engine and logged once; `biome_exists` only checks for a namespace.
+- **Region and plot build check.** `native_may_build` (`native_world_edit.rs`) for `can_place_block`, `can_break_block`,
+  `region_can_place`, `region_can_break`, and `region_section` (one check per block of the section). The bypass
+  permission stays in core. Still open: the debug `can_break_block` / `can_place_block` take no position
+  and stay stubs.
+- **Cancel a physical trigger.** `native_player_physical_trigger` (`native_hooks.rs`), with the `physical-trigger`
+  injection in `horizon-mixin.toml` that sets `cancel` for players with no-physical-trigger on.
+- **Chunk loading for far edits, with release.** `native_chunk_load_request`, `native_chunk_load_state`,
+  `native_chunk_load_release` and `native_chunk_is_loaded` (`native_chunk_tickets.rs`). The glue counts holds per chunk
+  and asks for the ticket once. Core now calls `release_chunk` (requests) and `release_chunk_load` (buffers) when a
+  chunk is done or the operation ends. Known gap: a request dropped when its player leaves releases only what it
+  had in flight; a buffer dropped without finishing keeps its holds until restart.
+- **Markers, chunk trackers, resend and relight, permission tri-state.** `native_level_markers`,
+  `native_chunk_trackers`, `native_resend_chunk`, `native_relight_chunks` and `native_player_permission_value` are in
+  the glue (`permission_value`, the chunk and marker hosts). Core: `markers`, `marker_custom_data` and
+  `marker_snapshot` take `&mut self` now, a signature change the engine forced. Core `cargo test --offline`: 301 pass.
+- **Block entity NBT in bulk.** `set_buffer` with `allowNbt` loads each chunk's block entities in one
+  `native_edit_blocks` call (`NativeBlockEdit.block_entities`, SNBT from `horizon_client::snbt::to_snbt`), after that
+  chunk's blocks are written. The core's `SetBlockHost::load_block_entities` replaces the per-block call. The block
+  states still go through `set_block_raw`, not through the edit. Untested: upstream refuses the whole edit if one
+  entry does not parse.
+- **Writable mod data folder (blueprints).** Blueprints load from `native_data_dir("axiom")/blueprints`
+  (`horizon-mods/.horizon-mod-data/axiom/`), outside the world, so a world reset keeps them. Annotations stay in the
+  world folder on purpose: they belong to their world. Blueprints saved under `<world>/axiom/blueprints` by an older
+  build are not moved.
+- **Entity spawn with the client's uuid.** `entity::build_detached_tree` (core) builds the tree with a UUID per entity.
+  The glue keeps it as a pending tree until `add_fresh_entity_with_passengers`, which summons each entity with
+  `native_summon_with_uuid` at the pose `place_tree` gave it, snaps and turns it, then mounts the passengers with
+  `native_mount`. A failed summon removes what was summoned of that tree. A refused mount is logged and the passenger
+  stays beside its vehicle. Untested against a client.
+- **Regex matcher.** Core `regex.rs`: a Pike VM (no backtracking, no crate) with Java `String.matches` semantics. It
+  covers the syntax in its module comment; anything else (possessive quantifiers, backreferences, lookaround, flags,
+  `\p`, nested classes, `&&`) is a syntax error. `matches_regex` and `world_filters_pass` (glue) fail closed.
+- **World whitelist and blacklist.** Wired through the regex matcher. An invalid pattern refuses every world. The filters
+  match the Paper world name for the three vanilla dimensions (`world`, `world_nether`, `world_the_end`), as Java matches
+  `World#getName`; other dimensions use their id. Open: a Paper config means the same worlds here only if Horizon's
+  world folders have Paper's names.
+- **Debug text of the restrictions.** Core `Restrictions::java_text` (Java `toString`; enum names derived from the
+  variant names, to check against the Java constants) and `RestrictionsState::restrictions_text`. The glue takes the
+  sender's text before it builds the host. Other players get none.
 
-- **Entity uuid lookup.** Needed by every entity packet, by uuid. The engine's `native_entity(id)` is by numeric id;
-  `native_entity_uuid(entity)` is by reference. The port scans `native_entities_in` on each entity packet and each
-  request, which is O(entities in the level) per packet. Shape: `native_entity_by_uuid_in(dimension, uuid) -> Option<u32>`
-  for every loaded level, backed by an index the engine keeps.
+Core `cargo test --offline`: 343 pass (adds the regex, detached-tree and restrictions-text tests).
+
+## Bundle notes (2026-11-11)
+
+- **Bundle with LuckPerms (Axiom item 7).** `axiom.*` nodes resolve through `native_has_permission`, so the LuckPerms
+  port must be in the same engine build. The bundle list is composed outside this repo.
+- **Region protection (Axiom item 8).** `native_may_build` (`native_world_edit.rs`) denies only when a mod's
+  `can_build` hook cancels. Axiom registers no `can_build` hook, so with no region mod loaded every edit is allowed.
+- **Original config file.** `plugins/AxiomPaper/config.yml` is read at server start (`register_config`), via the
+  vendored `yaml.rs` (`horizon-yaml`, unchanged). Changes to it take effect at the next start, as Paper's do. Without
+  the file, `config/axiom-server.toml` is the fallback.
+

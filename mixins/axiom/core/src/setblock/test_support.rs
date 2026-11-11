@@ -172,6 +172,8 @@ impl SetBlockHost for FakeHost {
     fn request_chunk_load(&mut self, _dim: &str, cx: i32, cz: i32) {
         self.calls.push(Call::RequestLoad(cx, cz));
     }
+    fn release_chunk_load(&mut self, _dim: &str, _cx: i32, _cz: i32) {}
+
     fn chunk_load_state(&self, dim: &str, cx: i32, cz: i32) -> ChunkLoadState {
         self.chunk_states.get(&(dim.to_string(), cx, cz)).copied().unwrap_or(ChunkLoadState::Loaded)
     }
@@ -202,7 +204,7 @@ impl SetBlockHost for FakeHost {
     fn sync_block_entity(&mut self, _dim: &str, _pos: BlockPos, _state: u32) -> bool {
         false
     }
-    fn load_block_entity_nbt(&mut self, _dim: &str, _pos: BlockPos, _nbt: &[u8]) {}
+    fn load_block_entities(&mut self, _dim: &str, _entries: &[(BlockPos, Vec<u8>)]) {}
     fn send_chunk(&mut self, _dim: &str, cx: i32, cz: i32) {
         self.calls.push(Call::SendChunk(cx, cz));
     }

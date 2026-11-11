@@ -5,15 +5,15 @@
 // Blind port (written 2026-11-09 against Horizon 92fd45976, not built). Each engine function used is named in the
 // native_* file it lives in. What has no engine function is a stub marked `// GAP:`, listed in GAPS.md.
 // Hooks have no game in hand, so they queue events; `tick` (server tick start) answers them in order.
+use super::Game;
 use super::native_configs::{NativeConfig, NativeConfigFile, NativeConfigKind};
 use super::native_server::{NativeCommand, NativeServerPlayer};
-use super::native_world_edit::{NativeBlockEdit, NativeBlockRun};
-use super::Game;
+use super::native_world_edit::{NativeBlockEdit, NativeBlockNbt, NativeBlockRun};
 use horizon_client::axiom::core::annotation::{
-    self, AnnotationHost, AnnotationState, MarkerEntity,
+    self, AnnotationHost, AnnotationState, MarkerData, MarkerEntity,
 };
 use horizon_client::axiom::core::blueprint::{self, BlueprintHost, BlueprintStore};
-use horizon_client::axiom::core::buf::{Nbt, Reader};
+use horizon_client::axiom::core::buf::{Nbt, Reader, Writer};
 use horizon_client::axiom::core::buffer::{zstd_compress, zstd_decompress};
 use horizon_client::axiom::core::constants::{
     CHANNEL_TUNNEL, SERVERBOUND_CHANNELS, TUNNEL_BUFFER_FLAG_FIRST, TUNNEL_BUFFER_FLAG_LAST,
@@ -28,30 +28,31 @@ use horizon_client::axiom::core::entity::{
 use horizon_client::axiom::core::request::{
     self, BlockStates, EntityInfo, RequestChunksOperation, RequestHost, SectionRead,
 };
+use horizon_client::axiom::core::regex::full_match;
 use horizon_client::axiom::core::restrictions::{
     AxiomHandshakeEvent, AxiomModifyWorldEvent, Config, MessageColor, PlotBounds, RestrictionsHost,
-    RestrictionsState,
+    RestrictionsState, original_path,
 };
-use horizon_client::axiom::core::setblock::block_packet::{handle_set_block, BlockHit, Hand};
+use horizon_client::axiom::core::setblock::block_packet::{BlockHit, Hand, handle_set_block};
 use horizon_client::axiom::core::setblock::buffer_packet::handle_buffer_packet;
 use horizon_client::axiom::core::setblock::dispatch::DispatchBudget;
 use horizon_client::axiom::core::setblock::tick_blocks::handle_tick_blocks;
 use horizon_client::axiom::core::setblock::{
-    BlockPos, ChunkLoadState, OperationQueue, SectionPermissionChecker, SetBlockConfig,
+    BlockPos, ChunkLoadState, LocalBox, OperationQueue, SectionPermissionChecker, SetBlockConfig,
     SetBlockHost,
 };
 use horizon_client::axiom::core::world::packets::{
     set_fly_speed, set_gamemode, set_world_time, teleport,
 };
 use horizon_client::axiom::core::world::{GameMode, Location, MarkerEntry, WorldHost, WorldState};
-use horizon_client::mod_api::ServerTickPhase;
+use horizon_client::mod_api::{GameRuleValue, NativeChunkLoad, ServerTickPhase};
 use horizon_client::text::Text;
 use horizon_world::nbt::{JavaString, Tag};
 use horizon_world::registry::BlockStateId;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 /// The mod id, the config file (`config/axiom-server.toml`) and the command names.
@@ -59,8 +60,7 @@ pub(super) const MOD_ID: &str = "axiom";
 
 /// What a fresh server writes: the keys of Axiom's config.yml live in `restrictions::Config`, whose defaults apply
 /// to every key not written here.
-const DEFAULT_CONFIG: &str =
-    "# Axiom server settings for Horizon. Keys as in AxiomPaperPlugin's config.yml; unset keys keep their defaults.\n";
+const DEFAULT_CONFIG: &str = "# Axiom server settings for Horizon. Keys as in AxiomPaperPlugin's config.yml; unset keys keep their defaults.\n";
 
 /// The one UUID AxiomDebugCommand also admits to `/axiompaperdebug`, besides operators and the axiom.* nodes.
 const DEBUG_EXTRA_UUID: u128 = 0xd0e0_5de7_6067_454d_beae_c6d1_9d88_6191;
@@ -72,8 +72,9 @@ const VANILLA_DIMENSIONS: [&str; 3] = [
     "minecraft:the_end",
 ];
 
-/// The owner name the chunk tickets of Axiom's requests are held under.
-const CHUNK_TICKET_OWNER: &str = "axiom";
+/// The owner the chunk tickets of Axiom's requests and buffers are held under. The engine refuses an owner
+/// without a namespace (`native_chunk_ticket`), so it has one.
+const CHUNK_TICKET_OWNER: &str = "axiom:chunks";
 
 /// A random 64-bit value from the std hasher, which is seeded per process. Enough for handshake ids and
 /// `UniformInt`-style draws; nothing here needs more.
@@ -82,23 +83,6 @@ fn random_u64() -> u64 {
     std::collections::hash_map::RandomState::new()
         .build_hasher()
         .finish()
-}
-
-/// Logs a STUB call once per process, so a missing engine function shows up in the log without flooding it.
-fn stub_once(name: &'static str) {
-    static SEEN: AtomicU64 = AtomicU64::new(0);
-    let bit = match name {
-        "set_day_time" => 1,
-        "set_time_frozen" => 2,
-        "set_weather_paused" => 4,
-        "set_weather" => 8,
-        _ => 0,
-    };
-    if bit != 0 && SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-        eprintln!(
-            "[WARN] [axiom] {name} is not supported on Horizon yet (see GAPS.md); nothing changed"
-        );
-    }
 }
 
 /// What the hooks heard, in order, until the next server tick.
@@ -124,6 +108,12 @@ static CONFIG_GEN: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     /// The one Axiom state of this server, held by the server thread.
     static STATE: RefCell<Option<AxiomState>> = const { RefCell::new(None) };
+}
+
+thread_local! {
+    /// Chunks held for Axiom's requests and buffers, with the holds on each. The engine's ticket is asked for on the
+    /// first hold and let go on the last release.
+    static CHUNK_HOLDS: RefCell<BTreeMap<(String, i32, i32), u32>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 /// Per-player reassembly of split tunnel packets (`AxiomPaper.tunnelPendingBuffers` / `skipCurrentTunnelPacket`).
@@ -211,17 +201,21 @@ pub(super) fn payload(player: u128, channel: &str, data: &[u8]) {
     });
 }
 
+/// The settings in force become `config`. A new config rebuilds the core state, so every client handshakes again.
+fn store(config: Config) {
+    *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(config);
+    CONFIG_GEN.fetch_add(1, Ordering::Relaxed);
+}
+
 /// `config/axiom-server.toml` was read (or saved): parse it with the core's `Config`. A file that does not parse
-/// keeps the settings in force. A new config rebuilds the core state, so every client handshakes again.
+/// keeps the settings in force. Only the TOML fallback is registered (see `register_config`), so this runs only
+/// when the original `plugins/AxiomPaper/config.yml` is absent.
 pub(super) fn config_changed(file: &NativeConfigFile) {
     if file.mod_id != MOD_ID || !matches!(file.kind, NativeConfigKind::Server) {
         return;
     }
     match Config::from_toml(&file.text) {
-        Ok(config) => {
-            *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = Some(config);
-            CONFIG_GEN.fetch_add(1, Ordering::Relaxed);
-        }
+        Ok(config) => store(config),
         Err(e) => eprintln!(
             "[WARN] [axiom] {}: {e}; keeping the settings in force",
             file.file
@@ -238,12 +232,29 @@ pub(super) fn with_config<R>(read: impl FnOnce(&Config) -> R) -> R {
     }
 }
 
+/// The original `plugins/AxiomPaper/config.yml` is the settings when it exists: it is read here, as the server
+/// starts, and no `config/axiom-server.toml` is registered (the engine would write one from the default). Without
+/// it, the TOML config is registered as before, as the fallback.
 pub(super) fn register_config(configs: &mut Vec<NativeConfig>) {
+    let original = original_path(&Game::game_dir());
+    if original.is_file() {
+        original_config_read(&original);
+        return;
+    }
     configs.push(NativeConfig::new(
         MOD_ID,
         NativeConfigKind::Server,
         DEFAULT_CONFIG,
     ));
+}
+
+/// The original file was found: read it with the core's loader. A file that does not parse keeps the settings in
+/// force (the defaults, at a first start), as a TOML that does not parse does.
+fn original_config_read(path: &Path) {
+    match Config::read_original(path) {
+        Ok((config, _read)) => store(config),
+        Err(e) => eprintln!("[WARN] [axiom] {e}; keeping the settings in force"),
+    }
 }
 
 pub(super) fn register(commands: &mut Vec<NativeCommand>) {
@@ -266,9 +277,9 @@ pub(super) fn perform(
         }
         "axiompapermigrateconfig" => {
             *ran = true;
-            // Paper's config.yml migration has no meaning here: the settings are TOML and read as they are.
+            // The Paper config is read as it is, so there is nothing to migrate.
             game.native_feedback(Text::literal(
-                "Axiom on Horizon reads config/axiom-server.toml; there is no Paper config to migrate.",
+                "Axiom on Horizon reads plugins/AxiomPaper/config.yml as it is; there is nothing to migrate.",
             ));
         }
         _ => {}
@@ -288,23 +299,40 @@ fn debug(game: &mut Game<'_>, player: &NativeServerPlayer, args: &str) {
         ));
         return;
     }
-    let (active, config) = snapshot();
+    let (active, config, restrictions) = snapshot(uuid);
     let text = {
-        let host = AxiomHost::new(game, active, config);
+        let mut host = AxiomHost::new(game, active, config);
+        host.debug_restrictions = restrictions.map(|text| (uuid, text));
         custom::debug_command(&host, Some(uuid), args)
             .unwrap_or_else(|| "This /axiompaperdebug subcommand is not known.".to_owned())
     };
     game.native_feedback(Text::literal(text));
 }
 
-/// The active players and the settings, for a command that runs outside the tick. Empty before the first tick.
-fn snapshot() -> (BTreeSet<u128>, Config) {
+/// Whether `player` has no-physical-trigger on (`axiom:set_no_physical_trigger`), read from the tick's state. False
+/// before the first tick, and while the tick holds the state (a plate set off inside the tick is not held).
+pub(super) fn no_physical_trigger(player: u128) -> bool {
+    STATE.with(|cell| match cell.try_borrow() {
+        Ok(slot) => slot
+            .as_ref()
+            .is_some_and(|state| state.world.is_no_physical_trigger(player)),
+        Err(_) => false,
+    })
+}
+
+/// The active players, the settings and the restrictions text of `player`, for a command that runs outside the tick.
+/// Empty before the first tick.
+fn snapshot(player: u128) -> (BTreeSet<u128>, Config, Option<String>) {
     STATE.with(|cell| match cell.try_borrow() {
         Ok(slot) => match slot.as_ref() {
-            Some(state) => (state.active.clone(), state.config.clone()),
-            None => (BTreeSet::new(), with_config(|c| c.clone())),
+            Some(state) => (
+                state.active.clone(),
+                state.config.clone(),
+                state.restrictions.restrictions_text(player),
+            ),
+            None => (BTreeSet::new(), with_config(|c| c.clone()), None),
         },
-        Err(_) => (BTreeSet::new(), with_config(|c| c.clone())),
+        Err(_) => (BTreeSet::new(), with_config(|c| c.clone()), None),
     })
 }
 
@@ -358,13 +386,16 @@ fn run_ticks(game: &mut Game<'_>, state: &mut AxiomState) {
     if !state.blueprints_loaded {
         state.blueprints_loaded = true;
         if host.config.blueprint_sharing {
-            if let Some(root) = host.world_dir().map(|d| d.join("axiom").join("blueprints")) {
-                let (store, errors) = BlueprintStore::load(&host, root);
-                for (path, e) in errors {
-                    eprintln!("[WARN] [axiom] blueprint {}: {e:?}", path.display());
-                }
-                state.blueprints = store;
+            // Server-wide, not part of a world: the mod's own data folder, which a world reset leaves alone.
+            let root = host.game.native_data_dir(MOD_ID).join("blueprints");
+            if let Err(e) = std::fs::create_dir_all(&root) {
+                eprintln!("[WARN] [axiom] blueprint folder {}: {e}", root.display());
             }
+            let (store, errors) = BlueprintStore::load(&host, root);
+            for (path, e) in errors {
+                eprintln!("[WARN] [axiom] blueprint {}: {e:?}", path.display());
+            }
+            state.blueprints = store;
         }
     }
     state.restrictions.tick(&mut host);
@@ -397,6 +428,10 @@ fn sync_active(host: &mut AxiomHost<'_, '_>, state: &mut AxiomState) {
         .filter(|p| state.restrictions.is_active(*p))
         .collect();
     state.active = host.active.clone();
+    client_versions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|p, _| state.restrictions.is_mismatched_data_version(*p));
 }
 
 /// Routes one payload the client sent on an `axiom:*` channel: the tunnel, or a packet on its own channel.
@@ -535,6 +570,8 @@ fn route(
     match channel {
         "axiom:hello" => {
             let before = state.restrictions.is_active(player);
+            // A new hello decides the client's release afresh (`map_client_block_registry`).
+            client_versions().lock().unwrap_or_else(|e| e.into_inner()).remove(&player);
             state
                 .restrictions
                 .on_hello(host, player, body)
@@ -640,6 +677,26 @@ fn send_initial(host: &mut AxiomHost<'_, '_>, state: &mut AxiomState, player: u1
     state.custom_displays.on_player_join(host, player);
 }
 
+/// The name the world filters match against: the world's folder name as Paper gives it for the vanilla dimensions
+/// (Java matches `World#getName`). Other dimensions keep their id.
+fn paper_world_name(dim: &str) -> &str {
+    match dim {
+        "minecraft:overworld" => "world",
+        "minecraft:the_nether" => "world_nether",
+        "minecraft:the_end" => "world_the_end",
+        other => other,
+    }
+}
+
+/// Java `canModifyWorld`'s two checks for world `dim`: the whitelist, when set, must match, and the blacklist, when
+/// set, must not. A pattern that does not compile fails both checks, so it refuses every world.
+fn world_filters_pass(config: &Config, dim: &str) -> bool {
+    let name = paper_world_name(dim);
+    let blank = |pattern: &str| pattern.trim().is_empty();
+    (blank(&config.whitelist_world_regex) || full_match(&config.whitelist_world_regex, name) == Ok(true))
+        && (blank(&config.blacklist_world_regex) || full_match(&config.blacklist_world_regex, name) == Ok(false))
+}
+
 /// The game as the core sees it. Players are UUIDs, blocks are state ids, dimensions are ids like
 /// `minecraft:overworld`. Built per tick with the settings and the active set it needs; the level is the one in place.
 struct AxiomHost<'a, 'g> {
@@ -649,6 +706,32 @@ struct AxiomHost<'a, 'g> {
     filter: EntityTypeFilter,
     /// Entities of the dimensions indexed for this call: client-visible uuid to (dimension, engine id).
     entities: HashMap<u128, (String, u32)>,
+    /// The restrictions text of the player who runs `/axiompaperdebug`, taken before the host was built.
+    debug_restrictions: Option<(u128, String)>,
+    /// Spawn trees the core built detached (`load_entity_tree`), keyed by the root's uuid, until they are added or
+    /// dropped. Lives as long as this host, which one spawn packet uses from start to end.
+    pending: HashMap<u128, PendingTree>,
+}
+
+/// Where a detached spawn tree is posed: `place_tree` snaps every entity of it to one position.
+#[derive(Clone, Copy, Debug, Default)]
+struct Pose {
+    pos: (f64, f64, f64),
+    yaw: f32,
+    pitch: f32,
+    head_yaw: f32,
+}
+
+/// A spawn tree the core built but has not added yet: its entities (root first, each with its parent) and its pose.
+struct PendingTree {
+    dim: String,
+    nodes: Vec<entity::DetachedEntity>,
+    pose: Pose,
+}
+
+/// A fresh random UUID for a passenger of a spawn tree.
+fn fresh_uuid() -> u128 {
+    (u128::from(random_u64()) << 64) | u128::from(random_u64())
 }
 
 impl<'a, 'g> AxiomHost<'a, 'g> {
@@ -663,11 +746,9 @@ impl<'a, 'g> AxiomHost<'a, 'g> {
             config,
             filter,
             entities: HashMap::new(),
+            pending: HashMap::new(),
+            debug_restrictions: None,
         }
-    }
-
-    fn world_dir(&self) -> Option<PathBuf> {
-        self.game.native_world_dir()
     }
 
     fn players(&self) -> Vec<NativeServerPlayer> {
@@ -773,9 +854,7 @@ impl<'a, 'g> AxiomHost<'a, 'g> {
 
     /// Whether the chunk is loaded in the level `dimension`.
     fn chunk_loaded(&self, dimension: &str, cx: i32, cz: i32) -> bool {
-        self.game
-            .native_chunk_snapshot(dimension, [cx, cz])
-            .is_some()
+        self.game.native_chunk_is_loaded(dimension, [cx, cz])
     }
 
     /// Many single blocks at once, through `native_edit_blocks`: the engine writes them into the chunks, works out
@@ -817,6 +896,7 @@ impl<'a, 'g> AxiomHost<'a, 'g> {
             filters: Vec::new(),
             runs,
             neighbour_updates,
+            block_entities: Vec::new(),
         };
         self.game.native_edit_blocks(dimension, &edit)
     }
@@ -825,6 +905,66 @@ impl<'a, 'g> AxiomHost<'a, 'g> {
     fn put_block(&mut self, dimension: &str, pos: [i32; 3], state: u32, flags: i32) -> bool {
         self.game
             .native_set_block(dimension, pos, BlockStateId(state), flags)
+    }
+
+    /// The player's name for the engine's region checks (empty when offline).
+    fn player_name(&self, player: u128) -> String {
+        self.players()
+            .into_iter()
+            .find(|p| p.uuid == player)
+            .map(|p| p.name)
+            .unwrap_or_default()
+    }
+
+    /// Java `canModifyWorld` as `setblock::can_modify_world` gives it: the config's world filters (which fail closed,
+    /// see `matches_regex`), then the event's default, cancelled unless `dim` is the player's own world.
+    fn modify_world_allowed(&self, player: u128, dim: &str) -> bool {
+        world_filters_pass(&self.config, dim) && self.dimension_of(player).as_deref() == Some(dim)
+    }
+
+    /// Sets the boolean game rule `rule` of `dim`'s level (`/gamerule`); nothing when the level is not open.
+    fn set_level_rule(&mut self, dim: &str, rule: &str, value: bool) {
+        if let Some(level) = self.game.native_level(dim) {
+            self.game
+                .native_level_set_game_rule(level, rule, GameRuleValue::Bool(value));
+        }
+    }
+
+    /// Holds chunk `chunk` of `dim` for Axiom. The engine's ticket is asked for on the first hold.
+    fn hold_chunk(&mut self, dim: &str, cx: i32, cz: i32) {
+        let first = CHUNK_HOLDS.with(|holds| {
+            let mut holds = holds.borrow_mut();
+            let count = holds.entry((dim.to_owned(), cx, cz)).or_insert(0);
+            *count += 1;
+            *count == 1
+        });
+        if first {
+            self.game
+                .native_chunk_load_request(CHUNK_TICKET_OWNER, dim, [cx, cz]);
+        }
+    }
+
+    /// Lets go of one hold on chunk `chunk` of `dim`. The engine's ticket is let go on the last one.
+    fn release_chunk_hold(&mut self, dim: &str, cx: i32, cz: i32) {
+        let last = CHUNK_HOLDS.with(|holds| {
+            let mut holds = holds.borrow_mut();
+            let key = (dim.to_owned(), cx, cz);
+            match holds.get_mut(&key) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                Some(_) => {
+                    holds.remove(&key);
+                    true
+                }
+                None => false,
+            }
+        });
+        if last {
+            self.game
+                .native_chunk_load_release(CHUNK_TICKET_OWNER, dim, [cx, cz]);
+        }
     }
 
     /// Indexes the entities of `dimension` by uuid, for the calls of this host. Scans every entity of the level
@@ -851,6 +991,19 @@ impl<'a, 'g> AxiomHost<'a, 'g> {
     /// The engine id and dimension of an indexed entity.
     fn entity_id(&self, uuid: u128) -> Option<u32> {
         self.entities.get(&uuid).map(|(_, id)| *id)
+    }
+
+    /// The detached spawn tree that holds `uuid` (its root or a passenger), if the core is building one.
+    fn pending_tree(&self, uuid: u128) -> Option<&PendingTree> {
+        self.pending
+            .values()
+            .find(|tree| tree.nodes.iter().any(|node| node.uuid == uuid))
+    }
+
+    fn pending_tree_mut(&mut self, uuid: u128) -> Option<&mut PendingTree> {
+        self.pending
+            .values_mut()
+            .find(|tree| tree.nodes.iter().any(|node| node.uuid == uuid))
     }
 
     /// Settings of the block packets, as `SetBlockPacketListener` reads them.
@@ -964,11 +1117,8 @@ impl RestrictionsHost for AxiomHost<'_, '_> {
     }
 
     fn permission_value(&self, player: u128, node: &str) -> Option<bool> {
-        // The permission providers answer TRUE or FALSE; nobody answering is NOT_SET.
-        let mut answer = None;
-        self.game
-            .native_permission_check(player, node, 1, &mut answer);
-        answer
+        // None when no permission mod sets the node (Bukkit's NOT_SET), `native_player_permission_value`.
+        self.game.native_player_permission_value(player, node)
     }
 
     fn is_online(&self, player: u128) -> bool {
@@ -1013,23 +1163,30 @@ impl RestrictionsHost for AxiomHost<'_, '_> {
         horizon_world::DATA_VERSION
     }
 
-    fn plugin_enabled(&self, _name: &str) -> bool {
-        // Horizon runs no Bukkit plugins: ViaVersion, LuckPerms, PlotSquared, WorldGuard and CoreProtect are absent.
-        false
+    fn plugin_enabled(&self, name: &str) -> bool {
+        // Horizon runs no Bukkit plugins: LuckPerms, PlotSquared, WorldGuard and CoreProtect are absent. ViaVersion's
+        // part (serving clients of other releases) is played by Horizon's protocol adapter.
+        name == "ViaVersion"
     }
 
     fn protocol_name(&self, protocol: i32) -> String {
         if protocol == horizon_protocol::PROTOCOL_VERSION {
             horizon_core::version::VERSION_ID.to_owned()
+        } else if let Some(version) = horizon_protocol::adapter::ServerVersion::from_protocol(protocol) {
+            version.name().to_owned()
         } else {
             protocol.to_string()
         }
     }
 
-    fn map_client_block_registry(&mut self, _player: u128, _protocol: i32) -> Result<(), String> {
-        // Horizon serves its own protocol only (a client on another one is refused before this is asked), so there
-        // is no ViaVersion block mapping to build.
-        Err("Horizon has no ViaVersion: only its own protocol is served".to_owned())
+    fn map_client_block_registry(&mut self, player: u128, protocol: i32) -> Result<(), String> {
+        // Java builds the client's block registry from ViaVersion's mappings; here the protocol adapter's tables
+        // for that release give the client's state ids.
+        let version = horizon_protocol::adapter::ServerVersion::from_protocol(protocol)
+            .filter(|v| v.ids().is_some())
+            .ok_or_else(|| "Horizon has no block mapping for this client version".to_owned())?;
+        client_versions().lock().unwrap_or_else(|e| e.into_inner()).insert(player, version);
+        Ok(())
     }
 
     fn is_plot_world(&self, _player: u128) -> bool {
@@ -1040,9 +1197,10 @@ impl RestrictionsHost for AxiomHost<'_, '_> {
         None
     }
 
-    fn matches_regex(&self, _pattern: &str, _text: &str) -> bool {
-        // GAP: regex matcher (GAPS.md, "World whitelist and blacklist"). `false` refuses the world, so a configured world filter fails closed.
-        false
+    fn matches_regex(&self, pattern: &str, text: &str) -> bool {
+        // A pattern that does not compile matches nothing: the whitelist then refuses the world, and the blacklist
+        // path is refused by `world_allowed_by_config`, which checks the same patterns.
+        full_match(pattern, paper_world_name(text)).unwrap_or(false)
     }
 
     fn on_axiom_handshake(&mut self, _event: &mut AxiomHandshakeEvent) {
@@ -1086,9 +1244,8 @@ impl WorldHost for AxiomHost<'_, '_> {
         self.game.native_has_permission(player, node, 1)
     }
 
-    fn can_modify_world(&self, _player: u128, _dim: &str) -> bool {
-        // GAP: region and plot build checks (GAPS.md, "Region and plot build check"). Denies every edit.
-        false
+    fn can_modify_world(&self, player: u128, dim: &str) -> bool {
+        self.modify_world_allowed(player, dim)
     }
 
     fn allow_teleport_between_worlds(&self) -> bool {
@@ -1099,35 +1256,44 @@ impl WorldHost for AxiomHost<'_, '_> {
         false
     }
 
-    fn set_day_time(&mut self, _dim: &str, _time: i32) {
-        // GAP: time of day setter (GAPS.md, "Set the time of day"). Logs once, changes nothing.
-        stub_once("set_day_time");
+    fn set_day_time(&mut self, dim: &str, time: i32) {
+        if let Some(level) = self.game.native_level(dim) {
+            self.game.native_level_set_day_time(level, time as i64);
+        }
     }
 
-    fn set_time_frozen(&mut self, _dim: &str, _frozen: bool) {
-        // GAP: time of day setter (GAPS.md, "Set the time of day"). Logs once, changes nothing.
-        stub_once("set_time_frozen");
+    fn set_time_frozen(&mut self, dim: &str, frozen: bool) {
+        self.set_level_rule(dim, "advance_time", !frozen);
     }
 
-    fn weather_paused(&self, _dim: &str) -> bool {
-        false
+    fn weather_paused(&self, dim: &str) -> bool {
+        // Paused is `advance_weather` off.
+        match self
+            .game
+            .native_level(dim)
+            .and_then(|level| self.game.native_level_game_rule(level, "advance_weather"))
+        {
+            Some(GameRuleValue::Bool(advancing)) => !advancing,
+            _ => false,
+        }
     }
 
-    fn set_weather_paused(&mut self, _dim: &str, _paused: bool) {
-        // GAP: game rule and weather setters (GAPS.md, "Game rule and weather setters"). Logs once, changes nothing.
-        stub_once("set_weather_paused");
+    fn set_weather_paused(&mut self, dim: &str, paused: bool) {
+        self.set_level_rule(dim, "advance_weather", !paused);
     }
 
     fn set_weather(
         &mut self,
-        _dim: &str,
-        _clear_time: i32,
-        _rain_time: i32,
-        _raining: bool,
-        _thundering: bool,
+        dim: &str,
+        clear_time: i32,
+        rain_time: i32,
+        raining: bool,
+        thundering: bool,
     ) {
-        // GAP: game rule and weather setters (GAPS.md, "Game rule and weather setters"). Logs once, changes nothing.
-        stub_once("set_weather");
+        if let Some(level) = self.game.native_level(dim) {
+            self.game
+                .native_level_set_weather(level, clear_time, rain_time, raining, thundering);
+        }
     }
 
     fn random_int(&mut self, min: i32, max: i32) -> i32 {
@@ -1157,22 +1323,36 @@ impl WorldHost for AxiomHost<'_, '_> {
         self.chunk_loaded(dim, cx, cz)
     }
 
-    fn players_tracking_chunk(&self, dim: &str, _cx: i32, _cz: i32) -> Vec<u128> {
-        // Approximation: every player in the dimension (over-sends, never misses one).
-        self.players_in_dimension(dim)
+    fn players_tracking_chunk(&self, dim: &str, cx: i32, cz: i32) -> Vec<u128> {
+        // The players the engine sends this chunk to (`native_chunk_trackers`).
+        self.game.native_chunk_trackers(dim, [cx, cz])
     }
 
-    fn send_chunk_with_light(&mut self, _players: &[u128], _dim: &str, _cx: i32, _cz: i32) {
-        // No-op by design: `native_edit_blocks` sends the chunks it changed whole, with their light.
+    fn send_chunk_with_light(&mut self, players: &[u128], dim: &str, cx: i32, cz: i32) {
+        // Whole, with its light, to each player who has the chunk (`native_resend_chunk`).
+        for &player in players {
+            self.game.native_resend_chunk(dim, [cx, cz], Some(player));
+        }
     }
 
-    fn relight_chunks(&mut self, _dim: &str, _chunks: &BTreeSet<(i32, i32)>) {
-        // No-op by design: `native_edit_blocks` relights the chunks it changed (`dirty_light`).
+    fn relight_chunks(&mut self, dim: &str, chunks: &BTreeSet<(i32, i32)>) {
+        let chunks: Vec<[i32; 2]> = chunks.iter().map(|&(cx, cz)| [cx, cz]).collect();
+        self.game.native_relight_chunks(dim, &chunks);
     }
 
-    fn marker_snapshot(&self, _dim: &str) -> Vec<MarkerEntry> {
-        // GAP: marker listing (GAPS.md, "Entity NBT reload and listing for display, marker and interaction kinds").
-        Vec::new()
+    fn marker_snapshot(&mut self, dim: &str) -> Vec<MarkerEntry> {
+        self.level_markers(dim)
+            .into_iter()
+            .map(|(uuid, position, data)| {
+                // Java `MarkerData.write`, as the annotation side encodes it.
+                let mut w = Writer::new();
+                MarkerData::create_from(uuid, position, &data).write(&mut w);
+                MarkerEntry {
+                    uuid,
+                    encoded: w.into_bytes(),
+                }
+            })
+            .collect()
     }
 
     fn anti_xray_enabled(&self, _player: u128) -> bool {
@@ -1262,9 +1442,8 @@ impl SetBlockHost for AxiomHost<'_, '_> {
         self.game.native_log("INFO", text);
     }
 
-    fn world_allowed_by_config(&self, _dim: &str) -> bool {
-        // GAP: world whitelist and blacklist regexes (GAPS.md, "World whitelist and blacklist"). Fails closed when either is set.
-        self.config.whitelist_world_regex.is_empty() && self.config.blacklist_world_regex.is_empty()
+    fn world_allowed_by_config(&self, dim: &str) -> bool {
+        world_filters_pass(&self.config, dim)
     }
 
     fn modify_world_event(&mut self, _player: u128, _dim: &str, cancelled: bool) -> bool {
@@ -1275,8 +1454,12 @@ impl SetBlockHost for AxiomHost<'_, '_> {
         self.config.max_chunk_load_distance_for(false)
     }
 
-    fn block_state_from_wire(&self, _player: u128, wire_id: i32) -> Option<u32> {
-        // Horizon serves its own protocol, so a wire id is the global state id.
+    fn block_state_from_wire(&self, player: u128, wire_id: i32) -> Option<u32> {
+        // A wire id is the global state id, or the client release's for a client mapped above.
+        let wire_id = match client_ids(player) {
+            Some(ids) => ids.block_state.up(wire_id)?,
+            None => wire_id,
+        };
         let state = u32::try_from(wire_id).ok()?;
         self.game
             .pack
@@ -1291,11 +1474,26 @@ impl SetBlockHost for AxiomHost<'_, '_> {
     }
 
     fn empty_state(&self) -> u32 {
-        self.default_state_of("minecraft:air").unwrap_or(0)
+        // Java `BlockBuffer.EMPTY_STATE`: void_air marks the cells a buffer leaves alone (air is a real edit).
+        self.default_state_of("minecraft:void_air")
+            .or_else(|| self.default_state_of("minecraft:air"))
+            .unwrap_or(0)
     }
 
     fn global_bits(&self) -> u8 {
         self.global_bits_value()
+    }
+
+    fn client_protocol(&self, player: u128) -> Option<i32> {
+        client_ids(player).and(client_versions().lock().unwrap_or_else(|e| e.into_inner()).get(&player).map(|v| v.protocol()))
+    }
+
+    fn client_global_bits(&self, player: u128) -> u8 {
+        match client_ids(player) {
+            // `Mth.ceillog2` of the client release's state count.
+            Some(ids) => (32 - (ids.states.0.max(2) - 1).leading_zeros()).max(4) as u8,
+            None => self.global_bits_value(),
+        }
     }
 
     fn same_block(&self, a: u32, b: u32) -> bool {
@@ -1377,15 +1575,21 @@ impl SetBlockHost for AxiomHost<'_, '_> {
     }
 
     fn request_chunk_load(&mut self, dim: &str, cx: i32, cz: i32) {
-        self.game
-            .native_force_chunk_in(CHUNK_TICKET_OWNER, dim, [cx, cz], true);
+        self.hold_chunk(dim, cx, cz);
+    }
+
+    fn release_chunk_load(&mut self, dim: &str, cx: i32, cz: i32) {
+        self.release_chunk_hold(dim, cx, cz);
     }
 
     fn chunk_load_state(&self, dim: &str, cx: i32, cz: i32) -> ChunkLoadState {
-        if self.chunk_loaded(dim, cx, cz) {
-            ChunkLoadState::Loaded
-        } else {
-            ChunkLoadState::Pending
+        match self
+            .game
+            .native_chunk_load_state(CHUNK_TICKET_OWNER, dim, [cx, cz])
+        {
+            NativeChunkLoad::Loaded => ChunkLoadState::Loaded,
+            NativeChunkLoad::Pending => ChunkLoadState::Pending,
+            NativeChunkLoad::Failed => ChunkLoadState::Failed,
         }
     }
 
@@ -1452,69 +1656,143 @@ impl SetBlockHost for AxiomHost<'_, '_> {
             .is_some()
     }
 
-    fn load_block_entity_nbt(&mut self, dim: &str, pos: BlockPos, nbt: &[u8]) {
-        let mut r = Reader::new(nbt);
-        let Ok(Nbt::Compound(map)) = r.read_nbt() else {
-            eprintln!("[WARN] [axiom] block entity NBT at {pos:?} is not a compound; not written");
+    fn load_block_entities(&mut self, dim: &str, entries: &[(BlockPos, Vec<u8>)]) {
+        // One bulk edit with no runs: the engine loads each entry after the runs (none here), and skips an entry
+        // whose position holds no block entity of its type. Entries that are not a compound are left out.
+        let mut block_entities = Vec::with_capacity(entries.len());
+        for (pos, nbt) in entries {
+            let mut r = Reader::new(nbt);
+            let Ok(Nbt::Compound(map)) = r.read_nbt() else {
+                eprintln!("[WARN] [axiom] block entity NBT at {pos:?} is not a compound; not written");
+                continue;
+            };
+            let tag = core_to_tag(&Nbt::Compound(map));
+            if !matches!(tag, Tag::Compound(_)) {
+                continue;
+            }
+            block_entities.push(NativeBlockNbt {
+                x: pos.0,
+                y: pos.1,
+                z: pos.2,
+                nbt: horizon_client::snbt::to_snbt(&tag),
+            });
+        }
+        if block_entities.is_empty() {
             return;
+        }
+        let edit = NativeBlockEdit {
+            palette: Vec::new(),
+            filters: Vec::new(),
+            runs: Vec::new(),
+            neighbour_updates: false,
+            block_entities,
         };
-        let Tag::Compound(compound) = core_to_tag(&Nbt::Compound(map)) else {
-            return;
-        };
-        self.game
-            .native_set_block_tag(dim, [pos.0, pos.1, pos.2], Tag::Compound(compound));
+        if let Err(e) = self.game.native_edit_blocks(dim, &edit) {
+            eprintln!("[WARN] [axiom] block entity edit in {dim}: {e}");
+        }
     }
 
     fn send_chunk(&mut self, _dim: &str, _cx: i32, _cz: i32) {
         // No-op by design: `native_set_block` and `native_edit_blocks` send the chunks they change.
     }
 
-    fn light_chunk(&mut self, _dim: &str, _cx: i32, _cz: i32) {
-        // No-op by design: the engine relights the chunks it changes.
+    fn light_chunk(&mut self, dim: &str, cx: i32, cz: i32) {
+        // Relight after a buffer write (`native_relight_chunks`, the chunk and its loaded ring).
+        self.game.native_relight_chunks(dim, &[[cx, cz]]);
     }
 
-    fn biome_exists(&self, _key: &str) -> bool {
-        // GAP: biome write (GAPS.md, "Write biomes"). No biome is writable, so biome buffers are refused.
-        false
+    fn biome_exists(&self, key: &str) -> bool {
+        // The engine refuses an unknown id when the cell is written (`native_set_biomes`, logged there); a key
+        // without a namespace is refused here.
+        key.contains(':')
     }
 
-    fn set_biome_quart(&mut self, _dim: &str, _qx: i32, _qy: i32, _qz: i32, _key: &str) {
-        // GAP: biome write (GAPS.md, "Write biomes"). Nothing changed.
+    fn set_biome_quart(&mut self, dim: &str, qx: i32, qy: i32, qz: i32, key: &str) {
+        if let Err(e) = self
+            .game
+            .native_set_biomes(dim, &[([qx, qy, qz], key.to_owned())])
+        {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("[WARN] [axiom] biome write refused: {e} (logged once)");
+            }
+        }
     }
 
-    fn players_tracking_chunk(&self, dim: &str, _cx: i32, _cz: i32) -> Vec<u128> {
-        // Approximation: every player in the dimension.
-        self.players_in_dimension(dim)
+    fn players_tracking_chunk(&self, dim: &str, cx: i32, cz: i32) -> Vec<u128> {
+        self.game.native_chunk_trackers(dim, [cx, cz])
     }
 
     fn send_chunk_biomes(&mut self, _player: u128, _dim: &str, _chunks: &[(i32, i32)]) {
-        // GAP: biome write (GAPS.md, "Write biomes"). Nothing to send.
+        // No-op by design: `native_set_biomes` sends the columns it changes.
     }
 
-    fn region_can_break(&self, _player: u128, _dim: &str, _pos: BlockPos) -> bool {
-        // GAP: region and plot build checks (GAPS.md, "Region and plot build check"). Denies every edit.
-        false
+    fn region_can_break(&self, player: u128, dim: &str, pos: BlockPos) -> bool {
+        self.game.native_may_build(
+            player,
+            &self.player_name(player),
+            dim,
+            [pos.0, pos.1, pos.2],
+            "break",
+        )
     }
 
-    fn region_can_place(&self, _player: u128, _dim: &str, _pos: BlockPos) -> bool {
-        // GAP: region and plot build checks (GAPS.md, "Region and plot build check"). Denies every edit.
-        false
+    fn region_can_place(&self, player: u128, dim: &str, pos: BlockPos) -> bool {
+        self.game.native_may_build(
+            player,
+            &self.player_name(player),
+            dim,
+            [pos.0, pos.1, pos.2],
+            "place",
+        )
     }
 
     fn region_section(
         &self,
-        _player: u128,
-        _dim: &str,
-        _cx: i32,
-        _cy: i32,
-        _cz: i32,
+        player: u128,
+        dim: &str,
+        cx: i32,
+        cy: i32,
+        cz: i32,
     ) -> SectionPermissionChecker {
-        // GAP: region and plot build checks (GAPS.md, "Region and plot build check"). No block of the section is allowed.
-        SectionPermissionChecker::from_allowed_boxes(Vec::new())
+        // One engine check per block of the section, the allowed blocks merged into runs along x.
+        let name = self.player_name(player);
+        let (x0, y0, z0) = (cx * 16, cy * 16, cz * 16);
+        let mut boxes = Vec::new();
+        let mut denied = false;
+        for y in 0..16 {
+            for z in 0..16 {
+                let mut run: Option<i32> = None;
+                for x in 0..=16 {
+                    let allowed = x < 16
+                        && self.game.native_may_build(
+                            player,
+                            &name,
+                            dim,
+                            [x0 + x, y0 + y, z0 + z],
+                            "place",
+                        );
+                    denied |= x < 16 && !allowed;
+                    match (allowed, run) {
+                        (true, None) => run = Some(x),
+                        (false, Some(start)) => {
+                            boxes.push(LocalBox::new(start, y, z, x - 1, y, z));
+                            run = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if !denied {
+            return SectionPermissionChecker::All;
+        }
+        SectionPermissionChecker::from_allowed_boxes(boxes)
     }
 
-    fn ack_block_changes(&mut self, _player: u128, _seq: i32) {
-        // GAP: block change acknowledgement (GAPS.md, "Block change acknowledgement"). Not sent.
+    fn ack_block_changes(&mut self, player: u128, sequence: i32) {
+        // Not in upstream Horizon yet (ClientboundBlockChangedAckPacket, GAPS.md "Block change acknowledgement").
+        self.game.native_ack_block_changes(player, sequence);
     }
 
     fn fire_player_interact(
@@ -1598,9 +1876,8 @@ impl EntityHost for AxiomHost<'_, '_> {
         self.game.native_has_permission(player, node, 1)
     }
 
-    fn can_modify_world(&self, _player: u128, _dim: &str) -> bool {
-        // GAP: region and plot build checks (GAPS.md, "Region and plot build check"). Denies every edit.
-        false
+    fn can_modify_world(&self, player: u128, dim: &str) -> bool {
+        self.modify_world_allowed(player, dim)
     }
 
     fn packet_collection_read_limit(&self) -> usize {
@@ -1636,14 +1913,14 @@ impl EntityHost for AxiomHost<'_, '_> {
         self.send_raw(player, channel, data);
     }
 
-    fn can_place_block(&self, _player: u128, _dim: &str, _x: i32, _y: i32, _z: i32) -> bool {
-        // GAP: region and plot build checks (GAPS.md, "Region and plot build check"). Denies every edit.
-        false
+    fn can_place_block(&self, player: u128, dim: &str, x: i32, y: i32, z: i32) -> bool {
+        self.game
+            .native_may_build(player, &self.player_name(player), dim, [x, y, z], "place")
     }
 
-    fn can_break_block(&self, _player: u128, _dim: &str, _x: i32, _y: i32, _z: i32) -> bool {
-        // GAP: region and plot build checks (GAPS.md, "Region and plot build check"). Denies every edit.
-        false
+    fn can_break_block(&self, player: u128, dim: &str, x: i32, y: i32, z: i32) -> bool {
+        self.game
+            .native_may_build(player, &self.player_name(player), dim, [x, y, z], "break")
     }
 
     fn is_in_spawnable_bounds(&self, x: i32, y: i32, z: i32) -> bool {
@@ -1686,6 +1963,9 @@ impl EntityHost for AxiomHost<'_, '_> {
     }
 
     fn position(&self, uuid: u128) -> Pos {
+        if let Some(tree) = self.pending_tree(uuid) {
+            return tree.pose.pos;
+        }
         let position = self
             .entity_id(uuid)
             .and_then(|id| self.game.native_entity(id))
@@ -1695,11 +1975,17 @@ impl EntityHost for AxiomHost<'_, '_> {
     }
 
     fn yaw(&self, uuid: u128) -> f32 {
-        self.rotation_of(uuid)[0]
+        match self.pending_tree(uuid) {
+            Some(tree) => tree.pose.yaw,
+            None => self.rotation_of(uuid)[0],
+        }
     }
 
     fn pitch(&self, uuid: u128) -> f32 {
-        self.rotation_of(uuid)[1]
+        match self.pending_tree(uuid) {
+            Some(tree) => tree.pose.pitch,
+            None => self.rotation_of(uuid)[1],
+        }
     }
 
     fn is_passenger(&self, _uuid: u128) -> bool {
@@ -1732,12 +2018,21 @@ impl EntityHost for AxiomHost<'_, '_> {
 
     fn load_entity_tree(
         &mut self,
-        _dim: &str,
-        _tag: &Nbt,
-        _root_uuid: u128,
+        dim: &str,
+        tag: &Nbt,
+        root_uuid: u128,
     ) -> Option<entity::EntityNode> {
-        // GAP: spawn with a client-chosen uuid (GAPS.md, "Entity spawn with the client's uuid"). Nothing is summoned.
-        None
+        // The tree is kept here, detached, until `add_fresh_entity_with_passengers` summons it at its pose.
+        let (node, nodes) = entity::build_detached_tree(tag, root_uuid, &mut fresh_uuid)?;
+        self.pending.insert(
+            root_uuid,
+            PendingTree {
+                dim: dim.to_owned(),
+                nodes,
+                pose: Pose::default(),
+            },
+        );
+        Some(node)
     }
 
     fn set_hanging_turn(&mut self, _uuid: u128, _turn: entity::Turn) {
@@ -1749,6 +2044,12 @@ impl EntityHost for AxiomHost<'_, '_> {
     }
 
     fn snap_to(&mut self, uuid: u128, pos: Pos, yaw: f32, pitch: f32) {
+        if let Some(tree) = self.pending_tree_mut(uuid) {
+            tree.pose.pos = pos;
+            tree.pose.yaw = yaw;
+            tree.pose.pitch = pitch;
+            return;
+        }
         if let Some(entity) = self
             .entity_id(uuid)
             .and_then(|id| self.game.native_entity(id))
@@ -1762,6 +2063,10 @@ impl EntityHost for AxiomHost<'_, '_> {
     }
 
     fn set_head_yaw(&mut self, uuid: u128, yaw: f32) {
+        if let Some(tree) = self.pending_tree_mut(uuid) {
+            tree.pose.head_yaw = yaw;
+            return;
+        }
         if let Some(entity) = self
             .entity_id(uuid)
             .and_then(|id| self.game.native_entity(id))
@@ -1771,6 +2076,10 @@ impl EntityHost for AxiomHost<'_, '_> {
     }
 
     fn set_yaw(&mut self, uuid: u128, yaw: f32) {
+        if let Some(tree) = self.pending_tree_mut(uuid) {
+            tree.pose.yaw = yaw;
+            return;
+        }
         let pitch = self.pitch(uuid);
         if let Some(entity) = self
             .entity_id(uuid)
@@ -1781,6 +2090,10 @@ impl EntityHost for AxiomHost<'_, '_> {
     }
 
     fn set_pitch(&mut self, uuid: u128, pitch: f32) {
+        if let Some(tree) = self.pending_tree_mut(uuid) {
+            tree.pose.pitch = pitch;
+            return;
+        }
         let yaw = self.yaw(uuid);
         if let Some(entity) = self
             .entity_id(uuid)
@@ -1791,6 +2104,10 @@ impl EntityHost for AxiomHost<'_, '_> {
     }
 
     fn set_pos_raw(&mut self, uuid: u128, pos: Pos) {
+        if let Some(tree) = self.pending_tree_mut(uuid) {
+            tree.pose.pos = pos;
+            return;
+        }
         if let Some((dim, id)) = self.entities.get(&uuid).cloned() {
             // Keep the entity's rotation: the engine moves and turns in one call.
             let (yaw, pitch) = match self.entity_data(uuid) {
@@ -1828,31 +2145,121 @@ impl EntityHost for AxiomHost<'_, '_> {
         }
     }
 
-    fn eject_passengers(&mut self, _uuid: u128) {
-        // GAP: riding and passengers (GAPS.md, "Riding, passengers and hanging entities").
+    fn eject_passengers(&mut self, uuid: u128) {
+        if let Some(vehicle) = self.entity_id(uuid) {
+            self.game.native_eject_passengers(vehicle);
+        }
     }
 
-    fn start_riding(&mut self, _passenger: u128, _vehicle: u128) {
-        // GAP: riding and passengers (GAPS.md, "Riding, passengers and hanging entities").
+    fn start_riding(&mut self, passenger: u128, vehicle: u128) {
+        if let (Some(rider), Some(vehicle)) = (self.entity_id(passenger), self.entity_id(vehicle)) {
+            self.game.native_mount(rider, vehicle);
+        }
     }
 
-    fn stop_riding(&mut self, _passenger: u128) {
-        // GAP: riding and passengers (GAPS.md, "Riding, passengers and hanging entities").
+    fn stop_riding(&mut self, passenger: u128) {
+        if let Some(rider) = self.entity_id(passenger) {
+            self.game.native_dismount(rider);
+        }
     }
 
-    fn add_fresh_entity_with_passengers(&mut self, _dim: &str, _uuid: u128) -> bool {
-        // GAP: spawn with a client-chosen uuid (GAPS.md, "Entity spawn with the client's uuid"). Nothing is added.
-        false
+    fn add_fresh_entity_with_passengers(&mut self, _dim: &str, uuid: u128) -> bool {
+        let Some(tree) = self.pending.remove(&uuid) else {
+            return false;
+        };
+        let pos = [tree.pose.pos.0, tree.pose.pos.1, tree.pose.pos.2];
+        // Every entity of the tree is summoned with its own uuid. A failure leaves nothing of the tree behind.
+        let mut summoned: Vec<(u128, u32)> = Vec::with_capacity(tree.nodes.len());
+        for node in &tree.nodes {
+            let Nbt::Compound(data) = &node.data else {
+                return rollback(self, &tree.dim, &summoned);
+            };
+            let Some(Nbt::String(kind)) = data.get("id") else {
+                return rollback(self, &tree.dim, &summoned);
+            };
+            let Tag::Compound(compound) = core_to_tag(&Nbt::Compound(data.clone())) else {
+                return rollback(self, &tree.dim, &summoned);
+            };
+            match self
+                .game
+                .native_summon_with_uuid(&tree.dim, kind, pos, compound, node.uuid)
+            {
+                Some(id) => summoned.push((node.uuid, id)),
+                None => {
+                    eprintln!(
+                        "[WARN] [axiom] spawn of {kind} {:032x} refused; the tree is not added",
+                        node.uuid
+                    );
+                    return rollback(self, &tree.dim, &summoned);
+                }
+            }
+        }
+        for &(node_uuid, id) in &summoned {
+            self.entities.insert(node_uuid, (tree.dim.clone(), id));
+        }
+        // The pose the core gave the tree, then the riders onto their vehicles (`tryAddFreshEntityWithPassengers`).
+        let (yaw, pitch) = (tree.pose.yaw, tree.pose.pitch);
+        for node in &tree.nodes {
+            self.snap_to(node.uuid, tree.pose.pos, yaw, pitch);
+            self.set_head_yaw(node.uuid, tree.pose.head_yaw);
+        }
+        for node in &tree.nodes {
+            let Some(parent) = node.parent else {
+                continue;
+            };
+            let rider = summoned.iter().find(|(u, _)| *u == node.uuid).map(|(_, id)| *id);
+            let vehicle = summoned.iter().find(|(u, _)| *u == parent).map(|(_, id)| *id);
+            if let (Some(rider), Some(vehicle)) = (rider, vehicle) {
+                if !self.game.native_mount(rider, vehicle) {
+                    eprintln!(
+                        "[WARN] [axiom] passenger {:032x} could not ride {:032x}; spawned beside it",
+                        node.uuid, parent
+                    );
+                }
+            }
+        }
+        true
     }
 
     fn remove(&mut self, uuid: u128) {
+        // A root drops its whole tree; a passenger the core pruned or removed leaves its tree's list.
+        if self.pending.remove(&uuid).is_none() {
+            for tree in self.pending.values_mut() {
+                tree.nodes.retain(|node| node.uuid != uuid);
+            }
+        }
         if let Some((dim, id)) = self.entities.remove(&uuid) {
             self.game.native_remove_entity(&dim, id);
         }
     }
 }
 
+/// Removes the entities of a spawn that failed part way, and reports the failure (false).
+fn rollback(host: &mut AxiomHost<'_, '_>, dim: &str, summoned: &[(u128, u32)]) -> bool {
+    for &(_, id) in summoned.iter().rev() {
+        host.game.native_remove_entity(dim, id);
+    }
+    false
+}
+
 impl AxiomHost<'_, '_> {
+    /// The markers of the level in place, as (uuid, position, custom data). Another level's markers are not
+    /// listed: the engine maps an id to an entity only in the level in place (`native_entity`).
+    fn level_markers(&mut self, dim: &str) -> Vec<(u128, [f64; 3], Nbt)> {
+        if !self.here(dim) {
+            return Vec::new();
+        }
+        self.game
+            .native_level_markers(dim)
+            .into_iter()
+            .filter_map(|(id, position, data)| {
+                let entity = self.game.native_entity(id)?;
+                let uuid = self.game.native_entity_uuid(entity)?;
+                Some((uuid, position, tag_to_core(&Tag::Compound(data))))
+            })
+            .collect()
+    }
+
     /// Yaw and pitch of an indexed entity, `[0, 0]` where there is none.
     fn rotation_of(&self, uuid: u128) -> [f32; 2] {
         self.entity_id(uuid)
@@ -1871,9 +2278,8 @@ impl RequestHost for AxiomHost<'_, '_> {
         self.game.native_has_permission(player, node, 1)
     }
 
-    fn is_mismatched_data_version(&self, _player: u128) -> bool {
-        // Horizon serves one data version: no client is on another.
-        false
+    fn is_mismatched_data_version(&self, player: u128) -> bool {
+        client_ids(player).is_some()
     }
 
     fn is_player_online(&self, player: u128) -> bool {
@@ -1888,14 +2294,18 @@ impl RequestHost for AxiomHost<'_, '_> {
         self.player_block_pos_of(player)
     }
 
-    fn can_modify_world(&self, _player: u128, _dimension: &str) -> bool {
-        // GAP: region and plot build checks (GAPS.md, "Region and plot build check"). Denies every edit.
-        false
+    fn can_modify_world(&self, player: u128, dimension: &str) -> bool {
+        self.modify_world_allowed(player, dimension)
     }
 
-    fn can_place_block(&self, _player: u128, _dimension: &str, _x: i32, _y: i32, _z: i32) -> bool {
-        // GAP: region and plot build checks (GAPS.md, "Region and plot build check"). Denies every edit.
-        false
+    fn can_place_block(&self, player: u128, dimension: &str, x: i32, y: i32, z: i32) -> bool {
+        self.game.native_may_build(
+            player,
+            &self.player_name(player),
+            dimension,
+            [x, y, z],
+            "place",
+        )
     }
 
     fn max_chunk_load_distance(&self, _dimension: &str) -> i32 {
@@ -1919,9 +2329,11 @@ impl RequestHost for AxiomHost<'_, '_> {
     }
 
     fn request_chunk(&mut self, dimension: &str, chunk_x: i32, chunk_z: i32) {
-        // GAP: release of a request's chunk tickets (GAPS.md, "Chunk loading for far edits, with release").
-        self.game
-            .native_force_chunk_in(CHUNK_TICKET_OWNER, dimension, [chunk_x, chunk_z], true);
+        self.hold_chunk(dimension, chunk_x, chunk_z);
+    }
+
+    fn release_chunk(&mut self, dimension: &str, chunk_x: i32, chunk_z: i32) {
+        self.release_chunk_hold(dimension, chunk_x, chunk_z);
     }
 
     fn is_chunk_ready(&self, dimension: &str, chunk_x: i32, chunk_z: i32) -> bool {
@@ -2121,8 +2533,8 @@ impl BlueprintHost for AxiomHost<'_, '_> {
         self.active.contains(&player) && self.game.native_has_permission(player, permission, 1)
     }
 
-    fn is_mismatched_data_version(&self, _player: u128) -> bool {
-        false
+    fn is_mismatched_data_version(&self, player: u128) -> bool {
+        client_ids(player).is_some()
     }
 
     fn game_version_name(&self) -> String {
@@ -2156,7 +2568,7 @@ impl AnnotationHost for AxiomHost<'_, '_> {
     }
 
     fn world_folder(&self, dim: &str) -> Option<PathBuf> {
-        // GAP: writable mod data folder (GAPS.md, "Writable mod data folder"). Kept inside the world for now.
+        // Annotations belong to their world, so they stay in the world folder (blueprints use the mod data folder).
         self.game.native_world_dir().map(|d| {
             d.join("axiom")
                 .join("annotations")
@@ -2180,19 +2592,26 @@ impl AnnotationHost for AxiomHost<'_, '_> {
         self.game.native_has_permission(player, node, 1)
     }
 
-    fn can_modify_world(&self, _player: u128, _dim: &str) -> bool {
-        // GAP: region and plot build checks (GAPS.md, "Region and plot build check"). Denies every edit.
-        false
+    fn can_modify_world(&self, player: u128, dim: &str) -> bool {
+        self.modify_world_allowed(player, dim)
     }
 
-    fn markers(&self, _dim: &str) -> Vec<MarkerEntity> {
-        // GAP: marker listing (GAPS.md, "Entity NBT reload and listing for display, marker and interaction kinds").
-        Vec::new()
+    fn markers(&mut self, dim: &str) -> Vec<MarkerEntity> {
+        self.level_markers(dim)
+            .into_iter()
+            .map(|(uuid, position, data)| MarkerEntity {
+                uuid,
+                position,
+                data,
+            })
+            .collect()
     }
 
-    fn marker_custom_data(&self, _dim: &str, _uuid: u128) -> Option<Nbt> {
-        // GAP: marker custom data (GAPS.md, "Entity data by numeric id in any loaded level").
-        None
+    fn marker_custom_data(&mut self, dim: &str, uuid: u128) -> Option<Nbt> {
+        self.level_markers(dim)
+            .into_iter()
+            .find(|(found, _, _)| *found == uuid)
+            .map(|(_, _, data)| data)
     }
 
     fn send_payload(&mut self, player: u128, channel: &str, data: Vec<u8>) {
@@ -2234,13 +2653,13 @@ impl DebugHost for AxiomHost<'_, '_> {
         self.active.contains(&player)
     }
 
-    fn is_mismatched_data_version(&self, _player: u128) -> bool {
-        false
+    fn is_mismatched_data_version(&self, player: u128) -> bool {
+        client_ids(player).is_some()
     }
 
-    fn can_modify_world(&self, _player: u128) -> bool {
-        // GAP: region and plot build checks (GAPS.md, "Region and plot build check"). Denies every edit.
-        false
+    fn can_modify_world(&self, player: u128) -> bool {
+        self.dimension_of(player)
+            .is_some_and(|dim| self.modify_world_allowed(player, &dim))
     }
 
     fn is_client_listening(&self, player: u128, channel: &str) -> bool {
@@ -2250,9 +2669,12 @@ impl DebugHost for AxiomHost<'_, '_> {
             .any(|c| c == channel)
     }
 
-    fn restrictions(&self, _player: u128) -> Option<String> {
-        // GAP: the restrictions of a player are held by the core state, not reachable from the host (GAPS.md, "Debug text of the restrictions").
-        None
+    fn restrictions(&self, player: u128) -> Option<String> {
+        // Only the sender's text was taken (`snapshot`); other players have none here.
+        self.debug_restrictions
+            .as_ref()
+            .filter(|(sender, _)| *sender == player)
+            .map(|(_, text)| text.clone())
     }
 
     fn can_break_block(&self, _player: u128, _provider: Option<Provider>) -> bool {
@@ -2272,4 +2694,17 @@ impl DebugHost for AxiomHost<'_, '_> {
     fn current_editable_plot(&self, _player: u128) -> String {
         "null".to_owned()
     }
+}
+
+/// Players whose Axiom client is on another release, with that release (`map_client_block_registry`).
+fn client_versions() -> &'static Mutex<HashMap<u128, horizon_protocol::adapter::ServerVersion>> {
+    static VERSIONS: std::sync::OnceLock<Mutex<HashMap<u128, horizon_protocol::adapter::ServerVersion>>> =
+        std::sync::OnceLock::new();
+    VERSIONS.get_or_init(Default::default)
+}
+
+/// The id tables of `player`'s release, if Axiom mapped it.
+fn client_ids(player: u128) -> Option<&'static horizon_protocol::adapter::ids::Ids> {
+    let version = *client_versions().lock().unwrap_or_else(|e| e.into_inner()).get(&player)?;
+    version.ids()
 }

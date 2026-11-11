@@ -12,7 +12,7 @@ mod permission;
 mod permission_set;
 mod state;
 
-pub use config::{Config, LimitOverride, MismatchAction};
+pub use config::{original_path, Config, LimitOverride, MismatchAction};
 pub use payload::{PlotBounds, PlotBox, Restrictions, CHANNEL_RESTRICTIONS};
 pub use permission::{AxiomPermission, ALL_PERMISSIONS};
 pub use permission_set::AxiomPermissionSet;

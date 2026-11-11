@@ -193,7 +193,7 @@ pub trait WorldHost {
     /// Runs the light engine over these chunks (`starlight$serverRelightChunks`).
     fn relight_chunks(&mut self, dim: &str, chunks: &BTreeSet<(i32, i32)>);
     /// Visible markers of the dimension (see `MarkerEntry`).
-    fn marker_snapshot(&self, dim: &str) -> Vec<MarkerEntry>;
+    fn marker_snapshot(&mut self, dim: &str) -> Vec<MarkerEntry>;
     /// Anti-xray would modify chunks around the player (`ChunkPacketBlockController.shouldModify`).
     fn anti_xray_enabled(&self, player: u128) -> bool;
 

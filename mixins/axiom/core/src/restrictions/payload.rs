@@ -64,6 +64,36 @@ impl Default for Restrictions {
 }
 
 impl Restrictions {
+    /// Java `Restrictions.toString()`, the text `/axiompaperdebug getRestrictions` shows: the permission sets by their
+    /// Java enum names (the variants keep Java's order), the reach, and the plot boxes as the PlotSquared record prints
+    /// them. The bounds are in the port's order, which Java's set does not fix.
+    pub fn java_text(&self) -> String {
+        let names = |set: &BTreeSet<AxiomPermission>| {
+            set.iter()
+                .map(|p| java_enum_name(&format!("{p:?}")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let boxes = self
+            .bounds
+            .iter()
+            .map(|b| {
+                format!(
+                    "PlotBox[min=({}, {}, {}), max=({}, {}, {})]",
+                    b.min[0], b.min[1], b.min[2], b.max[0], b.max[1], b.max[2]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "Restrictions{{allowedPermissions=[{}], deniedPermissions=[{}], infiniteReachLimit={}, bounds=[{}]}}",
+            names(&self.allowed_permissions),
+            names(&self.denied_permissions),
+            self.infinite_reach_limit,
+            boxes
+        )
+    }
+
     /// Restrictions granting `axiom.all` (what operators and `axiom.all` holders get).
     pub fn all(infinite_reach_limit: i32) -> Self {
         Self {
@@ -104,6 +134,18 @@ impl Restrictions {
 
         w.into_bytes()
     }
+}
+
+/// `EntitySpawn` to `ENTITY_SPAWN`, the Java constant name of a variant.
+fn java_enum_name(variant: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in variant.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.extend(c.to_uppercase());
+    }
+    out
 }
 
 fn clamp_corner(corner: [i32; 3]) -> [i32; 3] {
@@ -194,5 +236,22 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.encode(), b.encode());
         assert_ne!(a.encode(), Restrictions::all(8).encode());
+    }
+
+    #[test]
+    fn java_text_names_permissions_like_the_enum_constants() {
+        assert_eq!(
+            Restrictions::all(-1).java_text(),
+            "Restrictions{allowedPermissions=[ALL], deniedPermissions=[], infiniteReachLimit=-1, bounds=[]}"
+        );
+        let mut r = Restrictions::default();
+        r.denied_permissions.insert(AxiomPermission::EntitySpawn);
+        r.infinite_reach_limit = 8;
+        r.bounds.insert(PlotBox { min: [0, 64, 0], max: [15, 80, 15] });
+        assert_eq!(
+            r.java_text(),
+            "Restrictions{allowedPermissions=[DEFAULT], deniedPermissions=[ENTITY_SPAWN], infiniteReachLimit=8, \
+             bounds=[PlotBox[min=(0, 64, 0), max=(15, 80, 15)]]}"
+        );
     }
 }

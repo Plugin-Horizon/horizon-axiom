@@ -120,7 +120,7 @@ mod tests {
         BlueprintHeader {
             version: 2,
             name: "Tower".to_owned(),
-            author: "Leo".to_owned(),
+            author: "Alice".to_owned(),
             tags: vec!["a".to_owned(), "bb".to_owned()],
             thumbnail_yaw: 1.0,
             thumbnail_pitch: 2.0,

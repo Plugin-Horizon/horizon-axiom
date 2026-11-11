@@ -181,7 +181,7 @@ impl WorldHost for TestHost {
         self.calls.push(format!("relight {dim} {chunks:?}"));
     }
 
-    fn marker_snapshot(&self, dim: &str) -> Vec<MarkerEntry> {
+    fn marker_snapshot(&mut self, dim: &str) -> Vec<MarkerEntry> {
         self.markers.get(dim).cloned().unwrap_or_default()
     }
 

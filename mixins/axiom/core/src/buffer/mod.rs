@@ -17,6 +17,7 @@ mod position_map;
 
 pub use biome_buffer::BiomeBuffer;
 pub use block_buffer::BlockBuffer;
+pub use paletted::LongArrays;
 pub use block_entity::{zstd_compress, zstd_decompress, CompressedBlockEntity};
 pub use position_map::{Position2ByteMap, PositionSet};
 

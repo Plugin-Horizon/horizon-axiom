@@ -78,6 +78,16 @@ pub trait SetBlockHost {
     fn empty_state(&self) -> u32;
     /// Bit count of the global block state palette (9..=32), used to decode block buffers.
     fn global_bits(&self) -> u8;
+    /// The global palette width of `player`'s client: another release's for a client the server's protocol
+    /// adapter translates (Java: the ViaVersion-mapped registry), the server's own otherwise.
+    fn client_global_bits(&self, _player: u128) -> u8 {
+        self.global_bits()
+    }
+    /// The protocol of `player`'s client when the server's protocol adapter translates it (Java: the
+    /// ViaVersion protocol Axiom stored at hello); `None` for a client on the server's own protocol.
+    fn client_protocol(&self, _player: u128) -> Option<i32> {
+        None
+    }
     /// Java `a.getBlock() == b.getBlock()`.
     fn same_block(&self, a: u32, b: u32) -> bool;
     /// Java `BlockState.canBeReplaced()` for the state currently in the world.
@@ -107,6 +117,8 @@ pub trait SetBlockHost {
     fn is_chunk_loaded(&self, dim: &str, cx: i32, cz: i32) -> bool;
     /// Java `world.getChunkAtAsync(cx, cz)` (start loading; no-op if already loading or loaded).
     fn request_chunk_load(&mut self, dim: &str, cx: i32, cz: i32);
+    /// Lets go of the hold `request_chunk_load` took, once the chunk is written or the operation fails.
+    fn release_chunk_load(&mut self, dim: &str, cx: i32, cz: i32);
     /// Poll a chunk started with `request_chunk_load` (or any loaded chunk, which is `Loaded`).
     fn chunk_load_state(&self, dim: &str, cx: i32, cz: i32) -> ChunkLoadState;
     /// Java `level.getMinSectionY()` and `level.getMaxSectionY()`, both inclusive.
@@ -137,8 +149,10 @@ pub trait SetBlockHost {
     /// block entity, create one if missing (`newBlockEntity` + `addAndRegisterBlockEntity`), or update
     /// the existing one (`setBlockState` + ticker refresh). Returns true if a block entity exists afterwards.
     fn sync_block_entity(&mut self, dim: &str, pos: BlockPos, state: u32) -> bool;
-    /// Java `blockEntity.loadWithComponents(TagValueInput.create(... decompressed NBT))`.
-    fn load_block_entity_nbt(&mut self, dim: &str, pos: BlockPos, nbt: &[u8]);
+    /// Java `blockEntity.loadWithComponents(TagValueInput.create(... decompressed NBT))`, for every entry of one chunk
+    /// at once: the block entity data of each position, as network NBT, after the chunk's blocks are written. The
+    /// host writes them in one bulk edit; an entry whose position holds no block entity is skipped there.
+    fn load_block_entities(&mut self, dim: &str, entries: &[(BlockPos, Vec<u8>)]);
     /// Java `WorldExtension.sendChunk(cx, cz)`: send the chunk data to watching players.
     fn send_chunk(&mut self, dim: &str, cx: i32, cz: i32);
     /// Java `WorldExtension.lightChunk(cx, cz)`.

@@ -538,6 +538,77 @@ fn gate<H: EntityHost + ?Sized>(host: &H, player: u128, dim: &str, node: &str) -
 }
 
 /// Handle `axiom:spawn_entity` (SpawnEntityPacketListener).
+/// One entity of a tree built by [`build_detached_tree`]: its UUID, the UUID of the entity it rides in the tree
+/// (None for the root) and its data as saved, without the `Passengers` list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetachedEntity {
+    pub uuid: u128,
+    pub parent: Option<u128>,
+    pub data: Nbt,
+}
+
+/// Java `EntityType.loadEntityRecursive` for a spawn: the tree of `tag` as detached entities. The root gets
+/// `root_uuid`; every passenger gets a UUID from `fresh`, and a passenger without a valid `id` is left out, as Java
+/// does. Returns the tree (types and yaw, for pruning and placing) and the flat list, root first, in which each
+/// entity names its parent. None when the root has no `id`.
+pub fn build_detached_tree(
+    tag: &Nbt,
+    root_uuid: u128,
+    fresh: &mut dyn FnMut() -> u128,
+) -> Option<(EntityNode, Vec<DetachedEntity>)> {
+    let mut flat = Vec::new();
+    let node = detach(tag, root_uuid, None, fresh, &mut flat)?;
+    Some((node, flat))
+}
+
+fn detach(
+    tag: &Nbt,
+    uuid: u128,
+    parent: Option<u128>,
+    fresh: &mut dyn FnMut() -> u128,
+    flat: &mut Vec<DetachedEntity>,
+) -> Option<EntityNode> {
+    let Nbt::Compound(map) = tag else {
+        return None;
+    };
+    let Some(Nbt::String(type_id)) = map.get("id") else {
+        return None;
+    };
+    let yaw = match map.get("Rotation") {
+        Some(Nbt::List(items)) => match items.first() {
+            Some(Nbt::Float(yaw)) => *yaw,
+            _ => 0.0,
+        },
+        _ => 0.0,
+    };
+    let mut data = map.clone();
+    let passengers_tag = data.remove("Passengers");
+    flat.push(DetachedEntity {
+        uuid,
+        parent,
+        data: Nbt::Compound(data),
+    });
+    let mut passengers = Vec::new();
+    if let Some(Nbt::List(items)) = passengers_tag {
+        for item in &items {
+            // Only an entity that loads asks for a UUID.
+            if !matches!(item, Nbt::Compound(m) if matches!(m.get("id"), Some(Nbt::String(_)))) {
+                continue;
+            }
+            let child = fresh();
+            if let Some(node) = detach(item, child, Some(uuid), fresh, flat) {
+                passengers.push(node);
+            }
+        }
+    }
+    Some(EntityNode {
+        uuid,
+        type_id: type_id.clone(),
+        yaw,
+        passengers,
+    })
+}
+
 pub fn handle_spawn<H: EntityHost>(
     host: &mut H,
     player: u128,
@@ -1678,5 +1749,91 @@ mod tests {
         assert!(h.is_marker_hidden(5));
         h.forget_marker(5);
         assert!(!h.is_marker_hidden(5));
+    }
+}
+
+#[cfg(test)]
+mod detached_tree_tests {
+    use super::*;
+    use crate::buf::NbtCompound;
+
+    fn entity(id: &str, rotation: f32, passengers: Vec<Nbt>) -> Nbt {
+        let mut map = NbtCompound::new();
+        map.insert("id".into(), Nbt::String(id.into()));
+        map.insert("Rotation".into(), Nbt::List(vec![Nbt::Float(rotation), Nbt::Float(0.0)]));
+        if !passengers.is_empty() {
+            map.insert("Passengers".into(), Nbt::List(passengers));
+        }
+        Nbt::Compound(map)
+    }
+
+    /// Fresh UUIDs in the order they are asked for.
+    fn counter() -> impl FnMut() -> u128 {
+        let mut next = 100u128;
+        move || {
+            next += 1;
+            next
+        }
+    }
+
+    #[test]
+    fn root_gets_its_uuid_and_passengers_fresh_ones_in_order() {
+        let tag = entity(
+            "minecraft:boat",
+            90.0,
+            vec![entity("minecraft:zombie", 10.0, vec![entity("minecraft:chicken", 0.0, vec![])])],
+        );
+        let mut fresh = counter();
+        let (node, flat) = build_detached_tree(&tag, 7, &mut fresh).expect("loads");
+        assert_eq!(node.uuid, 7);
+        assert_eq!(node.type_id, "minecraft:boat");
+        assert_eq!(node.yaw, 90.0);
+        assert_eq!(node.passengers.len(), 1);
+        assert_eq!(node.passengers[0].uuid, 101);
+        assert_eq!(node.passengers[0].yaw, 10.0);
+        assert_eq!(node.passengers[0].passengers[0].uuid, 102);
+        // Flat list: root first, each entity names its parent.
+        let uuids: Vec<u128> = flat.iter().map(|e| e.uuid).collect();
+        assert_eq!(uuids, vec![7, 101, 102]);
+        assert_eq!(flat[0].parent, None);
+        assert_eq!(flat[1].parent, Some(7));
+        assert_eq!(flat[2].parent, Some(101));
+    }
+
+    #[test]
+    fn flat_data_drops_the_passengers_list_and_keeps_the_rest() {
+        let tag = entity("minecraft:armor_stand", 0.0, vec![entity("minecraft:marker", 0.0, vec![])]);
+        let (_, flat) = build_detached_tree(&tag, 1, &mut counter()).expect("loads");
+        let Nbt::Compound(root) = &flat[0].data else { panic!("compound") };
+        assert!(!root.contains_key("Passengers"));
+        assert_eq!(root.get("id"), Some(&Nbt::String("minecraft:armor_stand".into())));
+        assert!(root.contains_key("Rotation"));
+    }
+
+    #[test]
+    fn passenger_without_an_id_is_left_out_and_takes_no_uuid() {
+        let bad = Nbt::Compound(NbtCompound::new());
+        let tag = entity("minecraft:horse", 0.0, vec![bad, entity("minecraft:pig", 0.0, vec![])]);
+        let (node, flat) = build_detached_tree(&tag, 5, &mut counter()).expect("loads");
+        assert_eq!(node.passengers.len(), 1);
+        assert_eq!(node.passengers[0].type_id, "minecraft:pig");
+        // The skipped passenger asked for no UUID, so the pig takes the first fresh one.
+        assert_eq!(node.passengers[0].uuid, 101);
+        assert_eq!(flat.len(), 2);
+    }
+
+    #[test]
+    fn root_without_an_id_is_refused() {
+        let tag = Nbt::Compound(NbtCompound::new());
+        assert!(build_detached_tree(&tag, 1, &mut counter()).is_none());
+        assert!(build_detached_tree(&Nbt::Int(3), 1, &mut counter()).is_none());
+    }
+
+    #[test]
+    fn missing_rotation_reads_as_zero_yaw() {
+        let mut map = NbtCompound::new();
+        map.insert("id".into(), Nbt::String("minecraft:pig".into()));
+        let (node, _) = build_detached_tree(&Nbt::Compound(map), 1, &mut counter()).expect("loads");
+        assert_eq!(node.yaw, 0.0);
     }
 }

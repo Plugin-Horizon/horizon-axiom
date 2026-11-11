@@ -5,9 +5,12 @@
 // Defaults are the config.yml values. Keys the Java code reads without a config.yml entry
 // (`max-block-buffer-packet-size`) default to Java's getInt() fallback, 0.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::yaml::{self, Node};
 
 /// What to do when a client's Axiom or data version does not match the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +135,60 @@ impl Config {
         toml::from_str(text)
     }
 
+    /// Parses the original `plugins/AxiomPaper/config.yml` (Paper's file, read with the vendored YAML reader).
+    /// Returns the settings and every key path the loader asked for, whether the file has it or not. A key of
+    /// the wrong type keeps its default. `limits` is read as Java reads it: one entry per key, `example` included
+    /// (it is skipped when the overrides are used, see `dispatch_send_overrides`).
+    pub fn from_original_yaml(text: &str) -> Result<(Self, BTreeSet<String>), yaml::Error> {
+        let root = yaml::parse(text)?;
+        let mut keys = Keys { root: &root, read: BTreeSet::new() };
+        let mut c = Config::default();
+        keys.int("max-chunk-sends-per-tick", &mut c.max_chunk_sends_per_tick);
+        keys.int("max-chunk-relights-per-tick", &mut c.max_chunk_relights_per_tick);
+        keys.int("max-chunk-load-distance", &mut c.max_chunk_load_distance);
+        keys.bool("allow-teleport-between-worlds", &mut c.allow_teleport_between_worlds);
+        keys.bool("blueprint-sharing", &mut c.blueprint_sharing);
+        keys.bool("allow-large-chunk-data-request", &mut c.allow_large_chunk_data_request);
+        keys.bool("allow-large-payload-for-all-packets", &mut c.allow_large_payload_for_all_packets);
+        keys.string("incompatible-data-version", &mut c.incompatible_data_version);
+        keys.string("unsupported-axiom-version", &mut c.unsupported_axiom_version);
+        keys.string("whitelist-world-regex", &mut c.whitelist_world_regex);
+        keys.string("blacklist-world-regex", &mut c.blacklist_world_regex);
+        keys.int("block-buffer-rate-limit", &mut c.block_buffer_rate_limit);
+        keys.int("tunnel-split-size", &mut c.tunnel_split_size);
+        keys.int("maximum-tunnel-packet-size", &mut c.maximum_tunnel_packet_size);
+        keys.bool("log-large-block-buffer-changes", &mut c.log_large_block_buffer_changes);
+        keys.list("whitelist-entities", &mut c.whitelist_entities);
+        keys.list("blacklist-entities", &mut c.blacklist_entities);
+        keys.bool("disable-entity-sanitization", &mut c.disable_entity_sanitization);
+        keys.bool("send-markers", &mut c.send_markers);
+        keys.bool("allow-annotations", &mut c.allow_annotations);
+        keys.list("disallowed-blocks", &mut c.disallowed_blocks);
+        keys.int("infinite-reach-limit", &mut c.infinite_reach_limit);
+        keys.bool("log-core-protect-changes", &mut c.log_core_protect_changes);
+
+        // Every entry of `limits` is an override; a missing `limits` means none (not the `example` default).
+        c.limits = BTreeMap::new();
+        if let Some(limits) = keys.node("limits") {
+            for entry in limits.entries() {
+                let path = format!("limits.{}.block-buffer-rate-limit", entry.key);
+                keys.read.insert(path);
+                let mut limit = LimitOverride::default();
+                if let Some(v) = entry.value.get("block-buffer-rate-limit").and_then(int_of) {
+                    limit.block_buffer_rate_limit = v;
+                }
+                c.limits.insert(entry.key.clone(), limit);
+            }
+        }
+        Ok((c, keys.read))
+    }
+
+    /// Reads and parses the original config file (see `from_original_yaml`). Errors name the file, not its text.
+    pub fn read_original(path: &Path) -> Result<(Self, BTreeSet<String>), String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::from_original_yaml(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
     /// Action for an Axiom API version mismatch. Unknown strings mean `kick`, as in Java.
     pub fn unsupported_axiom_action(&self) -> MismatchAction {
         parse_action(&self.unsupported_axiom_version)
@@ -178,6 +235,53 @@ impl Config {
         } else {
             self.max_chunk_load_distance
         }
+    }
+}
+
+/// The original file's path in a server folder (`plugins/AxiomPaper/config.yml`).
+pub fn original_path(server_dir: &Path) -> PathBuf {
+    server_dir.join("plugins").join("AxiomPaper").join("config.yml")
+}
+
+/// A whole number as Bukkit's `getInt`: a float is truncated, anything else that is not a number is absent.
+fn int_of(node: &Node) -> Option<i32> {
+    let v = node.as_i64().or_else(|| node.as_f64().map(|f| f as i64))?;
+    i32::try_from(v).ok()
+}
+
+/// Reads keys of the original file and records the path of each one asked for.
+struct Keys<'a> {
+    root: &'a Node,
+    read: BTreeSet<String>,
+}
+
+impl<'a> Keys<'a> {
+    fn node(&mut self, path: &str) -> Option<&'a Node> {
+        self.read.insert(path.to_string());
+        self.root.path(path)
+    }
+
+    fn int(&mut self, path: &str, into: &mut i32) {
+        if let Some(v) = self.node(path).and_then(int_of) {
+            *into = v;
+        }
+    }
+
+    fn bool(&mut self, path: &str, into: &mut bool) {
+        if let Some(v) = self.node(path).and_then(Node::as_bool) {
+            *into = v;
+        }
+    }
+
+    fn string(&mut self, path: &str, into: &mut String) {
+        if let Some(v) = self.node(path).and_then(Node::as_str) {
+            *into = v.to_string();
+        }
+    }
+
+    /// Bukkit's `getStringList`: a missing or non-list value is an empty list.
+    fn list(&mut self, path: &str, into: &mut Vec<String>) {
+        *into = self.node(path).map(Node::str_list).unwrap_or_default();
     }
 }
 
@@ -258,5 +362,164 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.max_chunk_load_distance_for(true), 0);
         assert_eq!(c.max_chunk_load_distance_for(false), 256);
+    }
+
+    /// A file with the structure of AxiomPaper 6.0.1's config.yml (same keys, same order, same nesting), with the
+    /// default values. Hand-written: no server file is copied here.
+    const ORIGINAL_FIXTURE: &str = "\
+# Max chunk sends per tick (per-world), 0 = no limit
+max-chunk-sends-per-tick: 0
+max-chunk-relights-per-tick: 0
+max-chunk-load-distance: 256
+allow-teleport-between-worlds: true
+blueprint-sharing: false
+allow-large-chunk-data-request: false
+allow-large-payload-for-all-packets: false
+incompatible-data-version: \"warn\"
+unsupported-axiom-version: \"warn\"
+whitelist-world-regex: \"\"
+blacklist-world-regex: \"\"
+block-buffer-rate-limit: 0
+tunnel-split-size: 31000
+maximum-tunnel-packet-size: 2097152
+log-large-block-buffer-changes: false
+whitelist-entities: []
+blacklist-entities: []
+disable-entity-sanitization: false
+send-markers: false
+allow-annotations: false
+disallowed-blocks: []
+infinite-reach-limit: 256
+log-core-protect-changes: true
+limits:
+  example:
+    # Block buffer rate-limit (in chunk sections per second), 0 = default limit
+    block-buffer-rate-limit: 20
+";
+
+    /// Every key of `ORIGINAL_FIXTURE` the loader must read: the 24 top-level keys and the one nested key.
+    const ORIGINAL_KEYS: [&str; 25] = [
+        "max-chunk-sends-per-tick",
+        "max-chunk-relights-per-tick",
+        "max-chunk-load-distance",
+        "allow-teleport-between-worlds",
+        "blueprint-sharing",
+        "allow-large-chunk-data-request",
+        "allow-large-payload-for-all-packets",
+        "incompatible-data-version",
+        "unsupported-axiom-version",
+        "whitelist-world-regex",
+        "blacklist-world-regex",
+        "block-buffer-rate-limit",
+        "tunnel-split-size",
+        "maximum-tunnel-packet-size",
+        "log-large-block-buffer-changes",
+        "whitelist-entities",
+        "blacklist-entities",
+        "disable-entity-sanitization",
+        "send-markers",
+        "allow-annotations",
+        "disallowed-blocks",
+        "infinite-reach-limit",
+        "log-core-protect-changes",
+        "limits",
+        "limits.example.block-buffer-rate-limit",
+    ];
+
+    /// Leaf key paths of a tree (`limits.example.block-buffer-rate-limit`); lists are leaves.
+    fn leaf_paths(node: &Node, prefix: &str, out: &mut Vec<String>) {
+        for entry in node.entries() {
+            let path = if prefix.is_empty() { entry.key.clone() } else { format!("{prefix}.{}", entry.key) };
+            if entry.value.is_map() {
+                leaf_paths(&entry.value, &path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn original_fixture_equals_defaults_except_the_ignored_example() {
+        let (c, _) = Config::from_original_yaml(ORIGINAL_FIXTURE).unwrap();
+        // The `example` limit is read like any other entry, and only dispatch skips it, so the whole value
+        // equals Config::default().
+        assert_eq!(c, Config::default());
+        assert!(c.dispatch_send_overrides().is_empty());
+    }
+
+    #[test]
+    fn every_key_of_the_original_file_is_read() {
+        let root = yaml::parse(ORIGINAL_FIXTURE).unwrap();
+        let mut in_file = Vec::new();
+        leaf_paths(&root, "", &mut in_file);
+        let (_, read) = Config::from_original_yaml(ORIGINAL_FIXTURE).unwrap();
+        for key in &in_file {
+            assert!(read.contains(key), "key {key} of the file is not read");
+        }
+        let expected: BTreeSet<String> = ORIGINAL_KEYS.iter().map(|k| k.to_string()).collect();
+        assert_eq!(read, expected);
+    }
+
+    #[test]
+    fn missing_keys_keep_their_defaults_and_no_limits_means_no_overrides() {
+        let (c, read) = Config::from_original_yaml("").unwrap();
+        let mut expected = Config::default();
+        expected.limits.clear();
+        assert_eq!(c, expected);
+        assert!(read.contains("infinite-reach-limit"));
+    }
+
+    #[test]
+    fn limits_map_is_read_per_key_and_example_is_skipped_on_dispatch() {
+        let text = "limits:\n  example:\n    block-buffer-rate-limit: 20\n  vip:\n    block-buffer-rate-limit: 50\n  zero:\n    block-buffer-rate-limit: 0\n";
+        let (c, read) = Config::from_original_yaml(text).unwrap();
+        assert_eq!(c.limits.len(), 3);
+        assert_eq!(c.limits["vip"].block_buffer_rate_limit, 50);
+        assert!(read.contains("limits.vip.block-buffer-rate-limit"));
+        assert_eq!(c.dispatch_send_overrides(), vec![("vip".to_string(), 50)]);
+    }
+
+    #[test]
+    fn values_of_the_wrong_type_keep_their_defaults() {
+        let text = "infinite-reach-limit: \"abc\"\nallow-annotations: yes-ish\nblueprint-sharing: true\nmax-chunk-load-distance: 12.0\n";
+        let (c, _) = Config::from_original_yaml(text).unwrap();
+        assert_eq!(c.infinite_reach_limit, 256);
+        assert!(!c.allow_annotations);
+        assert!(c.blueprint_sharing);
+        assert_eq!(c.max_chunk_load_distance, 12);
+    }
+
+    #[test]
+    fn quoted_mismatch_actions_are_read_as_text() {
+        let (c, _) = Config::from_original_yaml("incompatible-data-version: 'ignore'\nunsupported-axiom-version: \"kick\"\n").unwrap();
+        assert_eq!(c.incompatible_data_action(), MismatchAction::Ignore);
+        assert_eq!(c.unsupported_axiom_action(), MismatchAction::Kick);
+    }
+
+    #[test]
+    fn a_tab_indented_file_is_a_parse_error() {
+        assert!(Config::from_original_yaml("limits:\n\tvip: 1\n").is_err());
+    }
+
+    #[test]
+    fn original_path_is_the_plugin_config() {
+        assert_eq!(
+            original_path(Path::new("/srv/server")),
+            PathBuf::from("/srv/server/plugins/AxiomPaper/config.yml")
+        );
+    }
+
+    #[test]
+    fn read_original_reads_a_file_and_names_a_missing_one() {
+        let dir = std::env::temp_dir().join(format!("axiom-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.yml");
+        std::fs::write(&file, ORIGINAL_FIXTURE).unwrap();
+        let (c, _) = Config::read_original(&file).unwrap();
+        assert_eq!(c, Config::default());
+        let missing = dir.join("no-such-file.yml");
+        let err = Config::read_original(&missing).unwrap_err();
+        assert!(err.contains("no-such-file.yml"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -72,6 +72,12 @@ impl RestrictionsState {
         self.active.contains(&player)
     }
 
+    /// Debug text of the restrictions last sent to `player` (Java `Restrictions.toString`), None when none were sent
+    /// yet. The glue takes it before it builds the host, so `/axiompaperdebug getRestrictions` can answer.
+    pub fn restrictions_text(&self, player: u128) -> Option<String> {
+        self.restrictions.get(&player).map(Restrictions::java_text)
+    }
+
     /// Java `isMismatchedDataVersion`: the player was accepted through a ViaVersion mapping.
     pub fn is_mismatched_data_version(&self, player: u128) -> bool {
         self.protocol_versions.contains_key(&player)

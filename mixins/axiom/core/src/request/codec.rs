@@ -102,7 +102,8 @@ pub fn compress_block_entity(nbt: &Nbt) -> Option<CompressedBlockEntity> {
 /// Encodes a section's block states as vanilla `PalettedContainer.write` does for block states.
 ///
 /// Layout: bits byte, then palette (single value: one varint; linear/hash map: count plus varint ids;
-/// global: nothing), then the packed storage as a long array (varint length plus big-endian longs).
+/// global: nothing), then the packed storage as big-endian longs without a count (vanilla since 1.21.5,
+/// `writeFixedSizeLongArray`; a single value has no longs).
 /// The palette order is first-seen order. The client accepts any valid palette, so this does not have
 /// to match the server's own container layout.
 pub fn encode_block_states(w: &mut Writer, states: &BlockStates, global_bits: u8) {
@@ -116,10 +117,9 @@ pub fn encode_block_states(w: &mut Writer, states: &BlockStates, global_bits: u8
     }
 
     if palette.len() == 1 {
-        // Single-valued: zero bits, no storage. The storage is an empty long array.
+        // Single-valued: zero bits, no storage.
         w.write_bytes(&[0]);
         w.write_varint(palette[0] as i32);
-        w.write_varint(0);
         return;
     }
 
@@ -146,7 +146,6 @@ pub fn encode_block_states(w: &mut Writer, states: &BlockStates, global_bits: u8
     for (index, value) in values.iter().enumerate() {
         longs[index / per_long] |= (*value as u64) << ((index % per_long) as u32 * bits);
     }
-    w.write_varint(longs.len() as i32);
     for long in longs {
         w.write_i64(long as i64);
     }
@@ -373,8 +372,8 @@ mod tests {
             }
             (Some(palette), bits)
         };
-        let (len, n) = read_varint(&bytes[pos..]);
-        pos += n;
+        // no count: as many longs as the bit count needs (none for a single value)
+        let len = if bits == 0 { 0 } else { SECTION_VOLUME.div_ceil((64 / bits) as usize) };
         let mut longs = Vec::new();
         for _ in 0..len {
             longs.push(u64::from_be_bytes(bytes[pos..pos + 8].try_into().unwrap()));
@@ -421,7 +420,7 @@ mod tests {
         let mut w = Writer::new();
         encode_block_states(&mut w, &[42u32; SECTION_VOLUME], 15);
         let bytes = w.into_bytes();
-        assert_eq!(bytes, vec![0, 42, 0]);
+        assert_eq!(bytes, vec![0, 42]);
     }
 
     #[test]

@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::buf::{Reader, Writer};
-use crate::buffer::{pack_pos, unpack_pos, BiomeBuffer, BlockBuffer, BufferError, CompressedBlockEntity};
+use crate::buffer::{pack_pos, unpack_pos, BiomeBuffer, BlockBuffer, BufferError, CompressedBlockEntity, LongArrays};
 
 use super::dispatch::DispatchBudget;
 use super::host::{BlockPos, ChunkLoadState, SetBlockHost};
@@ -29,13 +29,18 @@ pub enum BufferPacket {
 }
 
 /// Decode a SetBlockBuffer packet. `empty` is the "no block" state id and `global_bits` the palette bit count.
-pub fn parse_buffer_packet(r: &mut Reader, empty: u32, global_bits: u8) -> Result<BufferPacket, SetBlockError> {
+pub fn parse_buffer_packet(
+    r: &mut Reader,
+    empty: u32,
+    global_bits: u8,
+    framing: LongArrays,
+) -> Result<BufferPacket, SetBlockError> {
     let dim = r.read_string(32767)?;
     r.read_uuid()?; // discarded, buffers are not associated with a UUID
     let kind = r.read_bytes(1)?[0];
     match kind {
         BUFFER_TYPE_BLOCKS => {
-            let buffer = BlockBuffer::load(r, empty, global_bits)?;
+            let buffer = BlockBuffer::load(r, empty, global_bits, framing)?;
             let dispatch_sends = r.read_varint()? as i64;
             Ok(BufferPacket::Blocks { dim, buffer, dispatch_sends })
         }
@@ -58,9 +63,21 @@ pub fn handle_buffer_packet(
     player: u128,
     r: &mut Reader,
 ) -> Result<(), SetBlockError> {
-    let packet = parse_buffer_packet(r, host.empty_state(), host.global_bits())?;
+    let client_protocol = host.client_protocol(player);
+    let framing = client_protocol.map_or(LongArrays::Fixed, LongArrays::for_protocol);
+    let packet = parse_buffer_packet(r, host.empty_state(), host.client_global_bits(player), framing)?;
     let result = match packet {
-        BufferPacket::Blocks { dim, buffer, dispatch_sends } => {
+        BufferPacket::Blocks { dim, mut buffer, dispatch_sends } => {
+            // A client on another release sends its own state ids (Java: the ViaVersion-mapped registry).
+            if client_protocol.is_some() {
+                let empty = host.empty_state();
+                buffer.map_states(host.global_bits(), |v| {
+                    i32::try_from(v)
+                        .ok()
+                        .and_then(|id| host.block_state_from_wire(player, id))
+                        .unwrap_or(empty)
+                });
+            }
             apply_block_buffer(host, cfg, budget, queue, player, &dim, buffer, dispatch_sends)
         }
         BufferPacket::Biomes { dim, buffer, dispatch_sends } => {
@@ -217,6 +234,15 @@ impl SetBlockBufferOperation {
         Self { executor, buffer, allow_nbt, pending, futures: VecDeque::new(), game_master_warning: false, finished: false }
     }
 
+    /// Lets go of the holds of the chunks still loading, when the operation fails.
+    fn release_loading(&mut self, host: &mut dyn SetBlockHost, dim: &str) {
+        for (cx, cz, fut, _) in self.futures.drain(..) {
+            if fut == Fut::Loading {
+                host.release_chunk_load(dim, cx, cz);
+            }
+        }
+    }
+
     /// Start up to `MAX_CHUNK_FUTURES` chunk loads, nearest rules as in Java.
     fn start_futures(&mut self, host: &mut dyn SetBlockHost, dim: &str) {
         let max_distance = host.max_chunk_load_distance(dim);
@@ -242,6 +268,8 @@ impl SetBlockBufferOperation {
         let (min_section, max_section) = host.section_y_range(dim);
         let mut chunk_changed = false;
         let mut light_changed = false;
+        // Block entity data of this chunk, loaded in one bulk edit after its blocks are written.
+        let mut entities: Vec<(BlockPos, Vec<u8>)> = Vec::new();
 
         for (scx, scy, scz) in sections {
             if scy < min_section || scy > max_section {
@@ -293,10 +321,7 @@ impl SetBlockBufferOperation {
                                         .and_then(|map| map.get(&offset));
                                     if let Some(entity) = entity {
                                         match block_entity_bytes(entity) {
-                                            Ok(nbt) => {
-                                                host.load_block_entity_nbt(dim, pos, &nbt);
-                                                chunk_changed = true;
-                                            }
+                                            Ok(nbt) => entities.push((pos, nbt)),
                                             Err(e) => host.log_info(&format!(
                                                 "WARN: skipped block entity at {},{},{}: {e:?}",
                                                 pos.0, pos.1, pos.2
@@ -316,6 +341,10 @@ impl SetBlockBufferOperation {
             }
         }
 
+        if !entities.is_empty() {
+            host.load_block_entities(dim, &entities);
+            chunk_changed = true;
+        }
         if chunk_changed {
             host.send_chunk(dim, cx, cz);
             host.mark_chunk_unsaved(dim, cx, cz);
@@ -347,6 +376,7 @@ impl PendingOperation for SetBlockBufferOperation {
                 match host.chunk_load_state(dim, cx, cz) {
                     ChunkLoadState::Pending => return Ok(()),
                     ChunkLoadState::Failed => {
+                        self.release_loading(host, dim);
                         return Err(SetBlockError::ChunkLoadFailed { x: cx, z: cz });
                     }
                     ChunkLoadState::Loaded => {}
@@ -355,10 +385,12 @@ impl PendingOperation for SetBlockBufferOperation {
             let Some((_, _, _, sections)) = self.futures.pop_front() else { break };
 
             // A chunk that unloaded while queued is skipped. Java would hold the chunk object.
-            if !host.is_chunk_loaded(dim, cx, cz) {
-                continue;
+            if host.is_chunk_loaded(dim, cx, cz) {
+                self.write_chunk(host, dim, cx, cz, sections);
             }
-            self.write_chunk(host, dim, cx, cz, sections);
+            if fut == Fut::Loading {
+                host.release_chunk_load(dim, cx, cz);
+            }
         }
 
         if !self.pending.is_empty() {

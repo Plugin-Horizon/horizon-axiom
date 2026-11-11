@@ -131,3 +131,16 @@ helper = "helpers/config_reloading.rs"
 bindings = [
   { name = "file", ty = "&crate::game::native_configs::NativeConfigFile", value = "config" },
 ]
+
+# A player steps on a pressure plate or tripwire with no-physical-trigger on (`axiom:set_no_physical_trigger`): the
+# trigger is cancelled for that player only, as NoPhysicalTriggerListener cancels Bukkit's PHYSICAL interact. The
+# mods still hear it through the same hook.
+[[injection]]
+id = "physical-trigger"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::GameLevel<'_>::native_player_physical_trigger"
+helper = "helpers/physical_trigger.rs"
+bindings = [
+  { name = "player", ty = "u128", value = "player" },
+  { name = "cancel", ty = "&mut bool", value = "&mut *cancel" },
+]

@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use super::paletted::{self, Section};
+use super::paletted::{self, LongArrays, Section};
 use super::{read_i16, section_index, section_key, write_i16, BufferError, CompressedBlockEntity, END_OF_POSITIONS, SECTION_VOLUME};
 use crate::buf::{Reader, Writer};
 
@@ -43,14 +43,15 @@ impl BlockBuffer {
     }
 
     /// Reads entries until the end marker. Corresponds to `BlockBuffer.load`.
-    pub fn load(r: &mut Reader, empty: u32, global_bits: u8) -> Result<Self, BufferError> {
+    /// `framing`: how the sender frames section longs (an older client's, [`LongArrays::for_protocol`]).
+    pub fn load(r: &mut Reader, empty: u32, global_bits: u8, framing: LongArrays) -> Result<Self, BufferError> {
         let mut buffer = BlockBuffer::new(empty, global_bits);
         loop {
             let index = r.read_i64()?;
             if index == END_OF_POSITIONS {
                 break;
             }
-            let section = paletted::read_section(r, global_bits)?;
+            let section = paletted::read_section(r, global_bits, framing)?;
             buffer.sections.insert(index, section);
 
             let size = r.read_varint()?.min(MAX_BLOCK_ENTITIES_PER_SECTION);
@@ -68,6 +69,17 @@ impl BlockBuffer {
             }
         }
         Ok(buffer)
+    }
+
+    /// Every block state replaced by `f` (a client's ids to the server's), the buffer then in the server's
+    /// palette width `global_bits`. Java decodes with the player's mapped registry instead; the result is the same.
+    pub fn map_states(&mut self, global_bits: u8, f: impl Fn(u32) -> u32) {
+        for section in self.sections.values_mut() {
+            for v in section.iter_mut() {
+                *v = f(*v);
+            }
+        }
+        self.global_bits = global_bits;
     }
 
     /// Writes sections (sorted by key) and block entities, then the end marker.
@@ -182,6 +194,22 @@ mod tests {
     }
 
     #[test]
+    fn map_states_renumbers_every_block_and_takes_the_servers_width() {
+        // a client on another release: its stone is 16, its dirt 2999
+        let mut b = BlockBuffer::new(VOID, 14);
+        b.set(0, 0, 0, 16);
+        b.set(-20, 3, 7, 2999);
+        b.map_states(15, |v| match v {
+            16 => STONE,
+            2999 => DIRT,
+            other => other,
+        });
+        assert_eq!(b.get(0, 0, 0), Some(STONE));
+        assert_eq!(b.get(-20, 3, 7), Some(DIRT));
+        assert_eq!(b.global_bits, 15);
+    }
+
+    #[test]
     fn empty_state_reads_as_none() {
         let mut b = BlockBuffer::new(VOID, 15);
         b.set(5, 5, 5, VOID);
@@ -203,7 +231,7 @@ mod tests {
         b.save(&mut w).unwrap();
         let bytes = w.into_bytes();
         assert_eq!(bytes.len(), 8);
-        let back = BlockBuffer::load(&mut Reader::new(&bytes), VOID, 15).unwrap();
+        let back = BlockBuffer::load(&mut Reader::new(&bytes), VOID, 15, LongArrays::Fixed).unwrap();
         assert_eq!(back.section_count(), 0);
     }
 
@@ -226,7 +254,7 @@ mod tests {
         b.save(&mut w).unwrap();
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
-        let back = BlockBuffer::load(&mut r, VOID, 15).unwrap();
+        let back = BlockBuffer::load(&mut r, VOID, 15, LongArrays::Fixed).unwrap();
         assert_eq!(r.remaining(), 0);
 
         assert_eq!(back.section_count(), b.section_count());
@@ -250,7 +278,6 @@ mod tests {
         // Single-value section, value VOID.
         w.write_bytes(&[0]);
         w.write_varint(VOID as i32);
-        w.write_varint(0);
         // Two block entities.
         w.write_varint(2);
         for off in [7i16, 9] {
@@ -259,7 +286,7 @@ mod tests {
         }
         w.write_i64(END_OF_POSITIONS);
         let bytes = w.into_bytes();
-        let back = BlockBuffer::load(&mut Reader::new(&bytes), VOID, 15).unwrap();
+        let back = BlockBuffer::load(&mut Reader::new(&bytes), VOID, 15, LongArrays::Fixed).unwrap();
         assert_eq!(back.total_block_entities(), 2);
         assert_eq!(back.total_block_entity_bytes(), 2 * (2 + 1 + 1 + 1 + 1));
         assert_eq!(back.get(0, 0, 0), None); // whole section is void
@@ -271,11 +298,10 @@ mod tests {
         w.write_i64(section_key(0, 0, 0));
         w.write_bytes(&[0]);
         w.write_varint(DIRT as i32);
-        w.write_varint(0);
         w.write_varint(-1);
         w.write_i64(END_OF_POSITIONS);
         let bytes = w.into_bytes();
-        let back = BlockBuffer::load(&mut Reader::new(&bytes), VOID, 15).unwrap();
+        let back = BlockBuffer::load(&mut Reader::new(&bytes), VOID, 15, LongArrays::Fixed).unwrap();
         assert_eq!(back.total_block_entities(), 0);
         assert_eq!(back.get(3, 3, 3), Some(DIRT));
     }
