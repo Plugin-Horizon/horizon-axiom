@@ -840,12 +840,12 @@ mod tests {
 
     #[test]
     fn realistic_world_filters() {
-        let pattern = "^(rec_world|rec_aether|non_[a-z]+)$";
-        assert!(m(pattern, "rec_world"));
-        assert!(m(pattern, "rec_aether"));
-        assert!(m(pattern, "non_lobby"));
+        let pattern = "^(world_a|world_b|other_[a-z]+)$";
+        assert!(m(pattern, "world_a"));
+        assert!(m(pattern, "world_b"));
+        assert!(m(pattern, "other_x"));
         assert!(!m(pattern, "non_"));
-        assert!(!m(pattern, "non_lobby2"));
+        assert!(!m(pattern, "other_x2"));
         assert!(!m(pattern, "proxy"));
         assert!(m("stage|aether", "aether"));
         assert!(!m("stage|aether", "aether_nether"));
