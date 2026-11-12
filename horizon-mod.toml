@@ -1,0 +1,13 @@
+id = "axiom"
+name = "Axiom"
+version = "0.1.0"
+description = "Server side of Axiom (AxiomPaperPlugin, MIT) for Horizon: edit packets, restrictions handshake, chunk and entity requests."
+authors = ["CoreSMP"]
+api = "0.2"
+capabilities = ["registries"]
+
+[native]
+# Development build of arismoko/horizon main plus mod API additions (see README).
+game = "26.3"
+horizon = "54090ee36c4e2c7b43b66db864220c577b94b7e0"
+mixins = "5a64af938ec86b00d53d16a408aabc0038fb3e57"

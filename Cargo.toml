@@ -1,0 +1,12 @@
+[package]
+name = "mod-axiom"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The launcher (or stage.py) points this at the Horizon source the game is built from.
+horizon-mod-api = { git = "https://github.com/arismoko/horizon" }
+# The unchanged protocol core (codecs, buffers, restrictions, operations). No Horizon types.
+horizon-axiom-core = { path = "core" }
+
