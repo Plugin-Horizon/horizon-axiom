@@ -2,7 +2,7 @@ id = "axiom"
 name = "Axiom"
 version = "0.1.0"
 description = "Server side of Axiom (AxiomPaperPlugin, MIT) for Horizon: edit packets, restrictions handshake, chunk and entity requests."
-authors = ["CoreSMP"]
+authors = ["Plugin-Horizon contributors"]
 api = "0.2"
 capabilities = ["registries"]
 
