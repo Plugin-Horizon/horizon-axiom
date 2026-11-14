@@ -2001,11 +2001,12 @@ impl Hooks for Mod {
     }
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
-        // TODO(arismoko-api: command_zero_args): the debug command is registered with a text argument; check that
-        // `/axiompaperdebug` with no argument reaches the handler.
+        // The debug command takes an optional text argument (syntax `[args:text]`),
+        // so the bare form reaches the handler. Registered for every player: the handler checks op / axiom.debug
+        // itself (Java: the axiom.debug permission, not op only).
         event
             .commands
-            .push(Command::op("axiompaperdebug <args:text>", 1));
+            .push(Command::new("axiompaperdebug [args:text]"));
         event
             .commands
             .push(Command::op("axiompapermigrateconfig", 4));
