@@ -143,6 +143,8 @@ struct AxiomState {
     world: WorldState,
     custom_blocks: CustomBlockRegistry,
     custom_displays: CustomDisplayRegistry,
+    /// Players whose collision exclusion this mod set for noclip, so it is cleared when they stop.
+    noclip: BTreeSet<u128>,
 }
 
 impl AxiomState {
@@ -168,6 +170,7 @@ impl AxiomState {
             world: WorldState::new(),
             custom_blocks: CustomBlockRegistry::default(),
             custom_displays: CustomDisplayRegistry::default(),
+            noclip: BTreeSet::new(),
         }
     }
 }
@@ -325,6 +328,46 @@ fn left_player(state: &mut AxiomState, player: u128) {
     state.requests.retain(|op| op.executor() != player);
     state.world.set_no_physical_trigger(player, false);
     state.active.remove(&player);
+    // The game clears the player's collision exclusions when they leave.
+    state.noclip.remove(&player);
+}
+
+/// Half the side of the box around a noclip player in which blocks do not stop them: more than a tick's flight at
+/// Axiom's highest fly speed.
+const NOCLIP_REACH: f64 = 32.0;
+
+/// Java `AxiomPaper.onFailMove`: a flying player who may bypass movement restrictions
+/// (`axiom.player.bypass_movement_restrictions`) is not put back when a move ends in a block, which is Axiom's
+/// noclip. Horizon has no failed-move event; the same effect is a collision exclusion around the player, set again
+/// every tick while they fly and cleared when they land or lose the permission. Only the server's move check reads
+/// it: the client keeps its own collision, so a player without Axiom's noclip still stops at walls.
+fn noclip_tick(h: &mut AxiomHost<'_>, noclip: &mut BTreeSet<u128>) {
+    let mut now = BTreeSet::new();
+    for uuid in h.active.clone() {
+        if !permission_fallback(&*h.host, uuid, "axiom.player.bypass_movement_restrictions") {
+            continue;
+        }
+        let Some(player) = h.player(uuid) else {
+            continue;
+        };
+        if !player.abilities(&*h.host).is_some_and(|a| a.flying) {
+            continue;
+        }
+        let Some([x, y, z]) = player.entity().position(&*h.host) else {
+            continue;
+        };
+        let r = NOCLIP_REACH;
+        let boxes = [[x - r, y - r, z - r, x + r, y + r, z + r]];
+        if player.entity().set_collision_exclusions(&mut *h.host, &boxes).is_ok() {
+            now.insert(uuid);
+        }
+    }
+    for uuid in noclip.difference(&now) {
+        if let Some(player) = h.player(*uuid) {
+            let _ = player.entity().set_collision_exclusions(&mut *h.host, &[]);
+        }
+    }
+    *noclip = now;
 }
 
 /// The core's per-tick work, in Java's order.
@@ -337,6 +380,7 @@ fn run_ticks(host: &mut dyn ServerHost, state: &mut AxiomState) {
     }
     state.restrictions.tick(&mut h);
     sync_active(&mut h, state);
+    noclip_tick(&mut h, &mut state.noclip);
     state.operations.tick(&mut h);
     for op in state.requests.iter_mut() {
         op.tick(&mut h);
