@@ -3,3 +3,4 @@ Cargo.lock
 AGENT-BRIEF.md
 /target
 /core/target
+.horizon/

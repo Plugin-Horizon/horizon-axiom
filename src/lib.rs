@@ -5,39 +5,41 @@
 //!
 //! Fail-closed rule: where a write or a reply has no API, the write is refused and the reply is not sent, so the
 //! Axiom client never gets a handshake and nothing in the world changes.
-use horizon_axiom_core::annotation::{
+
+pub mod horizon_axiom_core;
+use crate::horizon_axiom_core::annotation::{
     self, AnnotationHost, AnnotationState, MarkerData, MarkerEntity,
 };
-use horizon_axiom_core::blueprint::{self, BlueprintHost, BlueprintStore};
-use horizon_axiom_core::buf::{BufError, Nbt, Reader, Writer};
-use horizon_axiom_core::buffer::{zstd_compress, zstd_decompress};
-use horizon_axiom_core::constants::CLIENTBOUND_CHANNELS;
-use horizon_axiom_core::constants::{
+use crate::horizon_axiom_core::blueprint::{self, BlueprintHost, BlueprintStore};
+use crate::horizon_axiom_core::buf::{BufError, Nbt, Reader, Writer};
+use crate::horizon_axiom_core::buffer::{zstd_compress, zstd_decompress};
+use crate::horizon_axiom_core::constants::CLIENTBOUND_CHANNELS;
+use crate::horizon_axiom_core::constants::{
     CHANNEL_TUNNEL, SERVERBOUND_CHANNELS, TUNNEL_BUFFER_FLAG_FIRST, TUNNEL_BUFFER_FLAG_LAST,
     TUNNEL_PACKET_FLAG_ZSTD_COMPRESSED,
 };
-use horizon_axiom_core::custom::{
+use crate::horizon_axiom_core::custom::{
     self, CustomBlockRegistry, CustomDisplayRegistry, CustomHost, DebugHost,
 };
-use horizon_axiom_core::entity::{self, EntityHost, EntityTypeFilter, HiddenEntities, Pos, Turn};
-use horizon_axiom_core::regex::full_match;
-use horizon_axiom_core::request::{
+use crate::horizon_axiom_core::entity::{self, EntityHost, EntityTypeFilter, HiddenEntities, Pos, Turn};
+use crate::horizon_axiom_core::regex::full_match;
+use crate::horizon_axiom_core::request::{
     self, EntityInfo, RequestChunksOperation, RequestHost, SectionRead,
 };
-use horizon_axiom_core::restrictions::{
+use crate::horizon_axiom_core::restrictions::{
     AxiomHandshakeEvent, AxiomModifyWorldEvent, Config as AxiomConfig, MessageColor, PlotBounds,
     RestrictionsHost, RestrictionsState, original_path,
 };
-use horizon_axiom_core::setblock::block_packet::{BlockHit, Hand, handle_set_block};
-use horizon_axiom_core::setblock::buffer_packet::handle_buffer_packet;
-use horizon_axiom_core::setblock::dispatch::DispatchBudget;
-use horizon_axiom_core::setblock::tick_blocks::handle_tick_blocks;
-use horizon_axiom_core::setblock::{
+use crate::horizon_axiom_core::setblock::block_packet::{BlockHit, Hand, handle_set_block};
+use crate::horizon_axiom_core::setblock::buffer_packet::handle_buffer_packet;
+use crate::horizon_axiom_core::setblock::dispatch::DispatchBudget;
+use crate::horizon_axiom_core::setblock::tick_blocks::handle_tick_blocks;
+use crate::horizon_axiom_core::setblock::{
     BlockPos, ChunkLoadState, OperationQueue, SectionPermissionChecker, SetBlockConfig,
     SetBlockHost,
 };
-use horizon_axiom_core::world::packets::{set_fly_speed, set_gamemode, set_world_time, teleport};
-use horizon_axiom_core::world::{
+use crate::horizon_axiom_core::world::packets::{set_fly_speed, set_gamemode, set_world_time, teleport};
+use crate::horizon_axiom_core::world::{
     GameMode as CoreGameMode, Location, MarkerEntry, WorldHost, WorldState,
 };
 use mod_api::{
@@ -48,7 +50,8 @@ use mod_api::{
     ServerTickPhase, Tag, Text,
 };
 use mod_api::{
-    IPayloadContext, IPayloadHandler, PayloadBytes, PayloadId, Registrar, RegistrationContext,
+    IPayloadContext, IPayloadHandler, PayloadBytes, PayloadHandleError, PayloadId, Registrar,
+    RegistrationContext,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -252,8 +255,13 @@ fn permission_fallback(host: &dyn ServerHost, uuid: u128, node: &str) -> bool {
     if DEFAULT_TRUE_NODES.contains(&node) {
         return true;
     }
+    // HMOD-GAP(permission-provider-answers): a typed node query (`permission_bool`) needs `&mut dyn ServerHost`, and
+    // every caller here holds only `&dyn ServerHost` or a `&self` host trait. Provider answers (LuckPerms) are lost,
+    // so only the operator-level fallback below is left: non-operators get no axiom.* node, `node` is not looked up.
+    let _ = node;
     host.player(uuid)
-        .is_some_and(|p| p.has_permission(host, node))
+        .and_then(|p| p.permission_level(host))
+        .is_some_and(|level| level >= 2)
 }
 
 /// Java `Player.isOp` as far as arismoko says it: a permission level of 1 and up.
@@ -688,7 +696,7 @@ impl<'a> AxiomHost<'a> {
         let Some(p) = self.player(player) else {
             return;
         };
-        if let Err(e) = p.kick(&mut *self.host, Text::literal(reason)) {
+        if let Err(e) = p.disconnect(&mut *self.host, Text::literal(reason)) {
             log(&format!("kick {player:032x} refused: {e:?}"));
         }
     }
@@ -878,9 +886,10 @@ impl RestrictionsHost for AxiomHost<'_> {
         permission_fallback(&*self.host, player, node)
     }
     fn permission_value(&self, player: u128, node: &str) -> Option<bool> {
-        // None when no permission provider decided the node.
-        self.player(player)
-            .and_then(|p| p.permission_value(&*self.host, node))
+        // HMOD-GAP(permission-provider-answers): no explicit provider answer can be read from `&self` (see
+        // permission_fallback). Always None = undecided, so the core's explicit allow/deny sets stay empty.
+        let _ = (player, node);
+        None
     }
     fn is_online(&self, player: u128) -> bool {
         self.player(player).is_some()
@@ -1460,7 +1469,9 @@ impl EntityHost for AxiomHost<'_> {
         self.entities.get(&uuid).is_some_and(|(d, _)| d == dim)
     }
     fn entity_type_id(&self, uuid: u128) -> Option<String> {
-        self.entity_of(uuid)?.kind(&*self.host)
+        self.entity_of(uuid)?
+            .kind(&*self.host)
+            .map(|kind| kind.id(&*self.host))
     }
     fn type_can_serialize(&self, type_id: &str) -> bool {
         type_id != entity::TYPE_PLAYER
@@ -1641,7 +1652,7 @@ impl AxiomHost<'_> {
         }
         let kind = entity.kind(&*self.host)?;
         let mut data = entity.nbt(&mut *self.host)?;
-        data.insert("id".into(), Tag::String(kind.as_str().into()));
+        data.insert("id".into(), Tag::String(kind.id(&*self.host).as_str().into()));
         Some(tag_to_core(&Tag::Compound(data)))
     }
 
@@ -1737,7 +1748,7 @@ impl RequestHost for AxiomHost<'_> {
         if dim.as_str() != dimension {
             return None;
         }
-        let entity_type = entity.kind(&*self.host)?;
+        let entity_type = entity.kind(&*self.host)?.id(&*self.host);
         let [x, y, z] = entity.position(&*self.host)?.map(|v| v.floor() as i32);
         Some(EntityInfo {
             entity_type,
@@ -1908,14 +1919,14 @@ impl DebugHost for AxiomHost<'_> {
     fn can_break_block(
         &self,
         player: u128,
-        _provider: Option<horizon_axiom_core::custom::Provider>,
+        _provider: Option<crate::horizon_axiom_core::custom::Provider>,
     ) -> bool {
         self.may_build(player)
     }
     fn can_place_block(
         &self,
         player: u128,
-        _provider: Option<horizon_axiom_core::custom::Provider>,
+        _provider: Option<crate::horizon_axiom_core::custom::Provider>,
     ) -> bool {
         self.may_build(player)
     }
@@ -2090,8 +2101,8 @@ impl IPayloadHandler for Inbox {
         &self,
         payload: PayloadBytes,
         context: &mut dyn IPayloadContext,
-    ) -> Result<(), String> {
-        let player = context.player().map_err(|e| format!("{e:?}"))?;
+    ) -> Result<(), PayloadHandleError> {
+        let player = context.player().map_err(|e| PayloadHandleError::Failed(format!("{e:?}")))?;
         on_custom_payload(player.uuid(), &self.0, &payload.0);
         Ok(())
     }

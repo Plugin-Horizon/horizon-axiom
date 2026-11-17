@@ -4,10 +4,11 @@ version = "0.1.0"
 description = "Server side of Axiom (AxiomPaperPlugin, MIT) for Horizon: edit packets, restrictions handshake, chunk and entity requests."
 authors = ["LionSpacer"]
 api = "0.2"
+side = "server"
 capabilities = ["registries"]
 
 [native]
 # Development build of arismoko/horizon main plus mod API additions (see README).
 game = "26.3"
-horizon = "54090ee36c4e2c7b43b66db864220c577b94b7e0"
-mixins = "5a64af938ec86b00d53d16a408aabc0038fb3e57"
+horizon = "bc5753b57d0c2e7824aa98a953f9e64d19dad873"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

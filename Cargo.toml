@@ -5,8 +5,12 @@ edition = "2024"
 publish = false
 
 [dependencies]
-# The launcher (or stage.py) points this at the Horizon source the game is built from.
-horizon-mod-api = { git = "https://github.com/arismoko/horizon" }
+# The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command.
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
 # The unchanged protocol core (codecs, buffers, restrictions, operations). No Horizon types.
-horizon-axiom-core = { path = "core" }
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+# Pure Rust zstd (decoder + fast encoder). Default features only pull twox-hash, which Horizon already locks.
+ruzstd = "0.9"
 
