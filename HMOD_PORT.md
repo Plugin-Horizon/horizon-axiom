@@ -11,3 +11,10 @@ Round 1
   - `PayloadHandleError` is imported from the `mod_api` root (assumed re-exported there, as worldedit does).
   - `PlayerRef::disconnect` and `EntityTypeKey::id` are inferred from the generator's `player_<x>` / `entity_type_key_id` naming, not compiled.
   - The gap stubs keep the old operator-level-2 fallback in `permission_fallback`; that level was taken from the old comment.
+
+Audit fixes
+- Fixed: `permission_fallback` no longer answers `true` for `axiom.default` / `axiom.use` or any operator at level 2: every `axiom.*` leaf, `axiom.default`, `axiom.all`, `axiom.debug`, `axiomadmin.bypass_region_checks` and the `axiomlimits.<key>` nodes of the config are typed Boolean nodes (op-default level 1), declared in `permission_gather_nodes`, asked through `permission_bool` every 20 ticks and kept for the `&self` host traits; a changed answer calls `on_permissions_changed`.
+- Fixed: `/axiompapermigrateconfig` now migrates `config.yml` (backup to `config.yml.bak`, shipped default with the set values, `src/config_migrate.rs`) and needs operator level 1; ops are told when the config is outdated.
+- Fixed: chunk holds use the ticket controller `axiom:chunks` (`set_mod_forced`), old tickets are released once at start.
+- Permission nodes: see above, declared in `Mod::permission_gather_nodes`.
+- Gaps: HMOD-GAP(permission-explicit-deny): typed query cannot tell deny from unset; wildcard nodes cannot be queried; `block_state_from_wire` still refuses every state (set_block / set_buffer write nothing until the engine has numeric state ids; not runtime-tested here).

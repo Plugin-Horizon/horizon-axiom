@@ -6,6 +6,7 @@
 //! Fail-closed rule: where a write or a reply has no API, the write is refused and the reply is not sent, so the
 //! Axiom client never gets a handshake and nothing in the world changes.
 
+mod config_migrate;
 pub mod horizon_axiom_core;
 use crate::horizon_axiom_core::annotation::{
     self, AnnotationHost, AnnotationState, MarkerData, MarkerEntity,
@@ -27,7 +28,7 @@ use crate::horizon_axiom_core::request::{
     self, EntityInfo, RequestChunksOperation, RequestHost, SectionRead,
 };
 use crate::horizon_axiom_core::restrictions::{
-    AxiomHandshakeEvent, AxiomModifyWorldEvent, Config as AxiomConfig, MessageColor, PlotBounds,
+    ALL_PERMISSIONS, AxiomHandshakeEvent, AxiomModifyWorldEvent, Config as AxiomConfig, MessageColor, PlotBounds,
     RestrictionsHost, RestrictionsState, original_path,
 };
 use crate::horizon_axiom_core::setblock::block_packet::{BlockHit, Hand, handle_set_block};
@@ -43,11 +44,12 @@ use crate::horizon_axiom_core::world::{
     GameMode as CoreGameMode, Location, MarkerEntry, WorldHost, WorldState,
 };
 use mod_api::{
-    Command, CommandArgumentValue, Compound, Config, ConfigFile, ConfigKind, ConfigLoadingEvent,
-    ConfigReloadingEvent, EntityRef, Flow, GameMode, GameRuleValue, Hooks, HostSide, LevelRef,
-    PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, RegisterCommandsEvent,
-    RegisterConfigsEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerTickEvent,
-    ServerTickPhase, Tag, Text,
+    ChunkRef, Command, CommandArgumentValue, Compound, Config, ConfigFile, ConfigKind,
+    ConfigLoadingEvent, ConfigReloadingEvent, EntityRef, Flow, GameMode, GameRuleValue, Hooks,
+    HostSide, LevelRef, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode,
+    PermissionValueType, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
+    RegisterCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerAboutToStartEvent,
+    ServerHost, ServerTickEvent, ServerTickPhase, Tag, Text, TicketController, TicketOwner,
 };
 use mod_api::{
     IPayloadContext, IPayloadHandler, PayloadBytes, PayloadHandleError, PayloadId, Registrar,
@@ -57,8 +59,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 const ID: &str = "axiom";
 
@@ -76,7 +78,12 @@ const VANILLA_DIMENSIONS: [&str; 3] = [
 ];
 
 /// The owner the chunk tickets of Axiom's requests and buffers are held under.
-const CHUNK_TICKET_OWNER: &str = "axiom:chunks";
+const CHUNK_TICKET_OWNER: TicketOwner = TicketOwner::Block([0, 0, 0]);
+
+/// The ticket controller `axiom:chunks`, made in `register`; unset when the game refused it.
+static CHUNK_CONTROLLER: OnceLock<TicketController> = OnceLock::new();
+/// Set once the tickets an earlier run left in the saves have been released.
+static OLD_TICKETS_RELEASED: AtomicBool = AtomicBool::new(false);
 
 /// Stands in for every block state id until arismoko exposes the game's numeric state ids (see `block_state_from_wire`).
 /// Writes never reach it, because no wire id maps to a state yet.
@@ -245,23 +252,113 @@ fn paper_world_name(dim: &str) -> &str {
 
 /// The play protocol of the game this mod is built for (26.3); Axiom's handshake compares the client's.
 const GAME_PROTOCOL: i32 = 777;
-/// Permission nodes a player gets without an operator level. Only these two are guessed from the core's default
-/// chain (`axiom.default`, `axiom.use`); check AxiomPaper's plugin.yml.
-const DEFAULT_TRUE_NODES: [&str; 2] = ["axiom.default", "axiom.use"];
+/// Nodes that are asked besides the core's own `axiom.*` ones: `/axiompaperdebug` and the region bypass.
+const EXTRA_NODES: [&str; 2] = ["axiom.debug", "axiomadmin.bypass_region_checks"];
 
-/// The permission check: a permission provider's answer for the node (LuckPerms, through `player_permission_check`),
-/// else operator level 2, the level the Paper ops of this network have. Default nodes pass for everyone.
-fn permission_fallback(host: &dyn ServerHost, uuid: u128, node: &str) -> bool {
-    if DEFAULT_TRUE_NODES.contains(&node) {
-        return true;
+/// How often (in ticks) the permission answers of the online players are asked again.
+const PERMISSION_REFRESH_TICKS: u32 = 20;
+
+thread_local! {
+    /// The nodes each online player holds, as of the last `refresh_permissions`. The core's host traits only get
+    /// `&self`, which cannot ask the permission service, so the answers are taken at the tick start.
+    static PERMS: RefCell<HashMap<u128, BTreeSet<String>>> = RefCell::new(HashMap::new());
+}
+static PERMISSION_TICKS: AtomicU32 = AtomicU32::new(0);
+/// `(added, removed)` top-level keys of the config file against the shipped default, as read at startup.
+static CONFIG_OUTDATED: Mutex<(usize, usize)> = Mutex::new((0, 0));
+
+/// Every node name this mod asks about: the core's non-wildcard `axiom.*` nodes (a typed node cannot carry a `*`;
+/// grants of a wildcard reach the leaf through the permission handler), `axiom.debug`, the region bypass and one
+/// `axiomlimits.<key>` per limit key of the config. Names a node cannot carry are left out.
+fn declared_nodes(limit_keys: &[String]) -> Vec<String> {
+    let mut nodes: Vec<String> = ALL_PERMISSIONS
+        .iter()
+        .map(|p| p.node().to_owned())
+        .chain(EXTRA_NODES.iter().map(|n| (*n).to_owned()))
+        .chain(limit_keys.iter().map(|k| format!("axiomlimits.{k}")))
+        .filter(|n| node_name_ok(n))
+        .collect();
+    nodes.sort();
+    nodes.dedup();
+    nodes
+}
+
+/// A typed node name: non-empty dot-separated segments of ASCII letters, digits, `_` and `-`.
+fn node_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && name.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+}
+
+fn typed_node(name: &str) -> PermissionNode {
+    PermissionNode::new(name, PermissionValueType::Boolean)
+}
+
+/// The limit keys of the config in force (`limits.<key>` with a rate limit, as `dispatch_send_overrides`).
+fn limit_keys() -> Vec<String> {
+    with_config(|c| c.dispatch_send_overrides())
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// Asks the permission service for every node of every online player and keeps the answers for the host traits.
+/// Any refusal is a denial. Returns the players whose answers differ from the last time (or are new).
+fn refresh_permissions(host: &mut dyn ServerHost) -> Vec<u128> {
+    let keys = limit_keys();
+    let nodes = declared_nodes(&keys);
+    let online = host.players().server_players();
+    let mut fresh: HashMap<u128, BTreeSet<String>> = HashMap::new();
+    for player in online {
+        let held: BTreeSet<String> = nodes
+            .iter()
+            .filter(|n| player.permission_bool(host, &typed_node(n)).unwrap_or(false))
+            .cloned()
+            .collect();
+        fresh.insert(player.uuid(), held);
     }
-    // HMOD-GAP(permission-provider-answers): a typed node query (`permission_bool`) needs `&mut dyn ServerHost`, and
-    // every caller here holds only `&dyn ServerHost` or a `&self` host trait. Provider answers (LuckPerms) are lost,
-    // so only the operator-level fallback below is left: non-operators get no axiom.* node, `node` is not looked up.
-    let _ = node;
-    host.player(uuid)
-        .and_then(|p| p.permission_level(host))
-        .is_some_and(|level| level >= 2)
+    PERMS.with(|cell| {
+        let mut old = cell.borrow_mut();
+        let changed = fresh
+            .iter()
+            .filter(|(uuid, held)| old.get(uuid) != Some(held))
+            .map(|(uuid, _)| *uuid)
+            .collect();
+        *old = fresh;
+        changed
+    })
+}
+
+/// Refreshes the answers every `PERMISSION_REFRESH_TICKS` ticks, and at once when a player has none yet.
+fn refresh_permissions_if_due(host: &mut dyn ServerHost) -> Vec<u128> {
+    let tick = PERMISSION_TICKS.fetch_add(1, Ordering::Relaxed);
+    let unknown = PERMS.with(|cell| {
+        let known = cell.borrow();
+        host.players()
+            .server_players()
+            .iter()
+            .any(|p| !known.contains_key(&p.uuid()))
+    });
+    if unknown || tick % PERMISSION_REFRESH_TICKS == 0 {
+        refresh_permissions(host)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Bukkit `player.hasPermission(node)` as far as the typed nodes go: the answer taken at the last refresh.
+/// Operators hold the nodes whose default level they reach; there is no blanket operator level and no free node.
+fn permission_fallback(_host: &dyn ServerHost, uuid: u128, node: &str) -> bool {
+    PERMS.with(|cell| {
+        cell.borrow()
+            .get(&uuid)
+            .is_some_and(|held| held.contains(node))
+    })
 }
 
 /// Java `Player.isOp` as far as arismoko says it: a permission level of 1 and up.
@@ -292,6 +389,8 @@ fn snapshot(player: u128) -> (BTreeSet<u128>, AxiomConfig, Option<String>) {
 fn tick(host: &mut dyn ServerHost) {
     let events = std::mem::take(&mut *EVENTS.lock().unwrap_or_else(|e| e.into_inner()));
     let generation = CONFIG_GEN.load(Ordering::Relaxed);
+    release_old_chunk_tickets(host);
+    let changed = refresh_permissions_if_due(host);
     with_state(|slot| {
         if slot.as_ref().is_none_or(|s| s.generation != generation) {
             *slot = Some(AxiomState::new(with_config(|c| c.clone()), generation));
@@ -299,6 +398,11 @@ fn tick(host: &mut dyn ServerHost) {
         let Some(state) = slot.as_mut() else {
             return;
         };
+        // Java `LuckPermsListener`: a changed answer drops the cached set and resends the restrictions.
+        for player in changed {
+            let mut h = AxiomHost::new(&mut *host, state.active.clone(), state.config.clone());
+            state.restrictions.on_permissions_changed(&mut h, player);
+        }
         for event in events {
             match event {
                 // Java sends its initial packets once the client has handshaked (`axiom:hello`), not on join.
@@ -317,6 +421,28 @@ fn tick(host: &mut dyn ServerHost) {
         }
         run_ticks(&mut *host, state);
     });
+}
+
+/// Releases, once, the tickets of `axiom:chunks` that an earlier run left in the saves: the engine keeps them across
+/// restarts, and nothing here would ever let go of them.
+fn release_old_chunk_tickets(host: &mut dyn ServerHost) {
+    if OLD_TICKETS_RELEASED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Some(controller) = CHUNK_CONTROLLER.get().copied() else {
+        return;
+    };
+    for dim in VANILLA_DIMENSIONS {
+        let Some(level) = host.level(dim) else {
+            continue;
+        };
+        let Some(tickets) = level.mod_forced_chunks(&*host, controller) else {
+            continue;
+        };
+        for (owner, [x, z], natural) in tickets {
+            let _ = ChunkRef::new(level, [x, z]).set_mod_forced(host, controller, owner, false, natural);
+        }
+    }
 }
 
 /// A player left: drop the parts of the state that only they own.
@@ -602,6 +728,11 @@ fn send_initial(host: &mut AxiomHost<'_>, state: &mut AxiomState, player: u128) 
     }
     state.custom_blocks.on_player_join(host, player);
     state.custom_displays.on_player_join(host, player);
+    if is_op_level(&*host.host, player) {
+        for line in outdated_config_notice() {
+            host.tell(player, &line);
+        }
+    }
 }
 
 /// A fresh random UUID for a passenger of a spawn tree.
@@ -744,30 +875,54 @@ impl<'a> AxiomHost<'a> {
         }
     }
 
-    /// Holds chunk `(cx, cz)` of `dim` for Axiom. TODO(arismoko-api: level_request_chunk_ticket): the engine ticket is
-    /// not requested, so far chunks may unload during a request.
+    /// Holds chunk `(cx, cz)` of `dim` for Axiom: the first hold forces it loaded through the `axiom:chunks` ticket
+    /// controller, later holds only count.
     fn hold_chunk(&mut self, dim: &str, cx: i32, cz: i32) {
-        CHUNK_HOLDS.with(|holds| {
-            *holds
-                .borrow_mut()
-                .entry((dim.to_owned(), cx, cz))
-                .or_insert(0) += 1
+        let first = CHUNK_HOLDS.with(|holds| {
+            let mut holds = holds.borrow_mut();
+            let count = holds.entry((dim.to_owned(), cx, cz)).or_insert(0);
+            *count += 1;
+            *count == 1
         });
+        if first {
+            self.force_chunk(dim, cx, cz, true);
+        }
     }
 
-    /// Lets go of one hold on chunk `(cx, cz)` of `dim`.
+    /// Lets go of one hold on chunk `(cx, cz)` of `dim`; the last one releases the ticket.
     fn release_chunk_hold(&mut self, dim: &str, cx: i32, cz: i32) {
-        CHUNK_HOLDS.with(|holds| {
+        let last = CHUNK_HOLDS.with(|holds| {
             let mut holds = holds.borrow_mut();
             let key = (dim.to_owned(), cx, cz);
             match holds.get_mut(&key) {
-                Some(count) if *count > 1 => *count -= 1,
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
                 Some(_) => {
                     holds.remove(&key);
+                    true
                 }
-                None => {}
+                None => false,
             }
         });
+        if last {
+            self.force_chunk(dim, cx, cz, false);
+        }
+    }
+
+    /// Takes or drops the ticket of one chunk. A game that refused the controller leaves the chunks unforced.
+    fn force_chunk(&mut self, dim: &str, cx: i32, cz: i32, forced: bool) {
+        let (Some(controller), Some(level)) = (CHUNK_CONTROLLER.get().copied(), self.level(dim)) else {
+            return;
+        };
+        let _ = ChunkRef::new(level, [cx, cz]).set_mod_forced(
+            &mut *self.host,
+            controller,
+            CHUNK_TICKET_OWNER,
+            forced,
+            false,
+        );
     }
 
     /// The block state at `pos`, from a loaded chunk. Every state reads as `UNMAPPED_STATE` (see `block_state_from_wire`).
@@ -886,10 +1041,9 @@ impl RestrictionsHost for AxiomHost<'_> {
         permission_fallback(&*self.host, player, node)
     }
     fn permission_value(&self, player: u128, node: &str) -> Option<bool> {
-        // HMOD-GAP(permission-provider-answers): no explicit provider answer can be read from `&self` (see
-        // permission_fallback). Always None = undecided, so the core's explicit allow/deny sets stay empty.
-        let _ = (player, node);
-        None
+        // HMOD-GAP(permission-explicit-deny): a typed Boolean query answers only yes or no, so an explicit deny
+        // cannot be told from "not set". A held node is Some(true); every other node is undecided (None).
+        permission_fallback(&*self.host, player, node).then_some(true)
     }
     fn is_online(&self, player: u128) -> bool {
         self.player(player).is_some()
@@ -1938,6 +2092,51 @@ impl DebugHost for AxiomHost<'_> {
     }
 }
 
+/// `AxiomPaper.migrateConfig`: backs `config.yml` up to `config.yml.bak`, then rewrites it as the shipped default
+/// with the values it sets. The answer lines, in order.
+fn migrate_config() -> Vec<String> {
+    let (added, removed) = *CONFIG_OUTDATED.lock().unwrap_or_else(|e| e.into_inner());
+    if added == 0 && removed == 0 {
+        return vec!["No migration necessary".to_owned()];
+    }
+    let path = original_path(Path::new("."));
+    let Ok(current) = std::fs::read_to_string(&path) else {
+        return vec!["Internal error: config.yml doesn't exist".to_owned()];
+    };
+    let backup = path.with_file_name("config.yml.bak");
+    if std::fs::copy(&path, &backup).is_err() {
+        return vec!["Internal error: couldn't backup existing config".to_owned()];
+    }
+    *CONFIG_OUTDATED.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0);
+    let mut lines = vec!["Successfully backed up current config to config.yml.bak".to_owned()];
+    let migrated = config_migrate::migrate(config_migrate::DEFAULT_CONFIG, &current);
+    if std::fs::write(&path, migrated).is_err() {
+        lines.push("Internal error: failed to save migrated config.yml".to_owned());
+        return lines;
+    }
+    lines.push("Successfully migrated config.yml".to_owned());
+    lines
+}
+
+/// The lines an operator is told once Axiom is active when the config file lags the shipped default.
+fn outdated_config_notice() -> Vec<String> {
+    let (added, removed) = *CONFIG_OUTDATED.lock().unwrap_or_else(|e| e.into_inner());
+    if added == 0 && removed == 0 {
+        return Vec::new();
+    }
+    let mut parts = Vec::new();
+    if added != 0 {
+        parts.push(format!("{added} new entries"));
+    }
+    if removed != 0 {
+        parts.push(format!("{removed} removed entries"));
+    }
+    vec![
+        format!("Axiom: Plugin config is outdated ({})", parts.join(", ")),
+        "Run /axiompapermigrateconfig to migrate the config".to_owned(),
+    ]
+}
+
 /// `/axiompaperdebug`: the core's `debug_command` answers the subcommands, for an operator or a player with axiom.*.
 fn debug(host: &mut dyn ServerHost, uuid: u128, args: &str) -> String {
     let (active, config, restrictions) = snapshot(uuid);
@@ -1960,6 +2159,22 @@ fn config_file(file: &ConfigFile) -> bool {
     file.mod_id == ID && matches!(file.kind, ConfigKind::Server)
 }
 
+/// The limit keys the config will carry once the server has started: the Paper file when there is one, else the
+/// settings read so far. The nodes are declared before `server_about_to_start` has read the file.
+fn original_limit_keys() -> Vec<String> {
+    let original = original_path(Path::new("."));
+    if original.is_file() {
+        if let Ok((config, _)) = AxiomConfig::read_original(&original) {
+            return config
+                .dispatch_send_overrides()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+        }
+    }
+    limit_keys()
+}
+
 #[derive(Default)]
 struct Mod;
 
@@ -1968,6 +2183,7 @@ impl Hooks for Mod {
     /// Declares the Axiom channels as raw play channels (arismoko #3209): serverbound ones with the inbox,
     /// clientbound ones send-only.
     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
+        let _ = CHUNK_CONTROLLER.set(r.register_ticket_controller("chunks", false));
         let mut handlers = r.payload_handlers();
         let mut registrar = handlers.registrar("1");
         for channel in SERVERBOUND_CHANNELS {
@@ -2008,6 +2224,26 @@ impl Hooks for Mod {
         let original = original_path(Path::new("."));
         if original.is_file() {
             original_config_read(&original);
+            if let Ok(text) = std::fs::read_to_string(&original) {
+                *CONFIG_OUTDATED.lock().unwrap_or_else(|e| e.into_inner()) =
+                    config_migrate::outdated(config_migrate::DEFAULT_CONFIG, &text);
+            }
+        }
+    }
+
+    fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
+        // Every node is op-default, as in AxiomPaper's plugin.yml (an undeclared default is op in Bukkit). Two
+        // differences: Bukkit's `axiomadmin.bypass_region_checks` is for nobody and `axiomlimits.*` is unset for
+        // everyone, which a level cannot say, so both take the highest level.
+        let op = PermissionLevel::from_level(1);
+        let keys = original_limit_keys();
+        for name in declared_nodes(&keys) {
+            let level = if name == "axiomadmin.bypass_region_checks" || name.starts_with("axiomlimits.") {
+                PermissionLevel::from_level(4)
+            } else {
+                op
+            };
+            let _ = event.nodes.add(typed_node(&name), NodeDefault::Level(level));
         }
     }
 
@@ -2020,7 +2256,7 @@ impl Hooks for Mod {
             .push(Command::new("axiompaperdebug [args:text]"));
         event
             .commands
-            .push(Command::op("axiompapermigrateconfig", 4));
+            .push(Command::op("axiompapermigrateconfig", 1));
     }
 
     fn run_mod_command(
@@ -2033,8 +2269,9 @@ impl Hooks for Mod {
         };
         match event.command.literals.first().map(String::as_str) {
             Some("axiompapermigrateconfig") => {
-                // The Paper config is read as it is, so there is nothing to migrate.
-                reply(host, "Axiom on Horizon reads plugins/AxiomPaper/config.yml as it is; there is nothing to migrate.".into());
+                for line in migrate_config() {
+                    reply(host, line);
+                }
                 Flow::Cancel
             }
             Some("axiompaperdebug") => {
@@ -2115,4 +2352,42 @@ fn encode_marker(uuid: u128, position: [f64; 3], data: &Nbt) -> Vec<u8> {
     let mut w = Writer::new();
     MarkerData::create_from(uuid, position, data).write(&mut w);
     w.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declared_nodes_have_no_wildcards_and_no_free_nodes() {
+        let nodes = declared_nodes(&["vip".to_owned(), "bad key".to_owned()]);
+        assert!(nodes.contains(&"axiom.use".to_owned()));
+        assert!(nodes.contains(&"axiom.default".to_owned()));
+        assert!(nodes.contains(&"axiom.all".to_owned()));
+        assert!(nodes.contains(&"axiom.debug".to_owned()));
+        assert!(nodes.contains(&"axiomadmin.bypass_region_checks".to_owned()));
+        assert!(nodes.contains(&"axiomlimits.vip".to_owned()));
+        assert!(!nodes.contains(&"axiom.entity.*".to_owned()));
+        assert!(!nodes.contains(&"axiomlimits.bad key".to_owned()));
+        assert!(nodes.iter().all(|n| node_name_ok(n)));
+    }
+
+    #[test]
+    fn a_player_without_an_answer_holds_no_node() {
+        PERMS.with(|cell| cell.borrow_mut().clear());
+        PERMS.with(|cell| {
+            cell.borrow_mut()
+                .insert(7, BTreeSet::from(["axiom.use".to_owned()]))
+        });
+        let held = |node: &str| {
+            PERMS.with(|cell| {
+                cell.borrow()
+                    .get(&7)
+                    .is_some_and(|set| set.contains(node))
+            })
+        };
+        assert!(held("axiom.use"));
+        assert!(!held("axiom.default"));
+        assert!(!held("axiom.entity.spawn"));
+    }
 }
