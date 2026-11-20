@@ -1403,9 +1403,14 @@ impl WorldHost for AxiomHost<'_> {
             level.relight_chunks(&mut *self.host, &list);
         }
     }
-    fn marker_snapshot(&mut self, _dim: &str) -> Vec<MarkerEntry> {
-        // TODO(arismoko-api: level_markers): markers are entities the port cannot list yet.
-        Vec::new()
+    fn marker_snapshot(&mut self, dim: &str) -> Vec<MarkerEntry> {
+        self.level_markers(dim)
+            .into_iter()
+            .map(|(uuid, position, data)| MarkerEntry {
+                uuid,
+                encoded: encode_marker(uuid, position, &data),
+            })
+            .collect()
     }
     fn anti_xray_enabled(&self, _player: u128) -> bool {
         false
@@ -1982,7 +1987,47 @@ impl EntityHost for AxiomHost<'_> {
     }
 }
 
+/// The vanilla keys `Entity.saveWithoutId` writes beside a marker's custom data. Custom data is merged into the same
+/// root, so `/data get entity` shows both; these are cut to leave `MarkerData.getData`'s compound.
+const MARKER_VANILLA_KEYS: [&str; 12] = [
+    "Pos", "Motion", "Rotation", "FallDistance", "Fire", "Air", "OnGround", "Invulnerable", "PortalCooldown", "UUID",
+    "Tags", "Passengers",
+];
+
 impl AxiomHost<'_> {
+    /// The markers of `dim` (`minecraft:marker`) as `(uuid, position, custom data)`, in the level's entity order.
+    /// Markers hidden by Axiom's gizmo flag are listed too: that flag is in the core state, not in this host.
+    fn level_markers(&mut self, dim: &str) -> Vec<(u128, [f64; 3], Nbt)> {
+        let Some(level) = self.level(dim) else {
+            return Vec::new();
+        };
+        let entities = level.all_entities(&*self.host).unwrap_or_default();
+        let mut out = Vec::new();
+        for entity in entities {
+            let kind = entity.kind(&*self.host).map(|k| k.id(&*self.host));
+            if kind.as_deref() != Some(entity::TYPE_MARKER) {
+                continue;
+            }
+            let Some(uuid) = entity.uuid(&mut *self.host) else {
+                continue;
+            };
+            let Some(pos) = entity.position(&*self.host) else {
+                continue;
+            };
+            let Some(data) = entity.nbt(&mut *self.host) else {
+                continue;
+            };
+            let Nbt::Compound(mut map) = tag_to_core(&Tag::Compound(data)) else {
+                continue;
+            };
+            for key in MARKER_VANILLA_KEYS {
+                map.remove(key);
+            }
+            out.push((uuid, pos, Nbt::Compound(map)));
+        }
+        out
+    }
+
     /// The NBT of a loaded entity, with its `id`, as a save would give it.
     fn saved_entity(&mut self, dimension: &str, uuid: u128) -> Option<Nbt> {
         let (dim, entity) = self.entities.get(&uuid)?.clone();
@@ -2251,12 +2296,21 @@ impl AnnotationHost for AxiomHost<'_> {
     fn can_modify_world(&self, player: u128, dim: &str) -> bool {
         self.modify_world_allowed(player, dim)
     }
-    fn markers(&mut self, _dim: &str) -> Vec<MarkerEntity> {
-        // TODO(arismoko-api: level_markers): as `marker_snapshot`.
-        Vec::new()
+    fn markers(&mut self, dim: &str) -> Vec<MarkerEntity> {
+        self.level_markers(dim)
+            .into_iter()
+            .map(|(uuid, position, data)| MarkerEntity {
+                uuid,
+                position,
+                data,
+            })
+            .collect()
     }
-    fn marker_custom_data(&mut self, _dim: &str, _uuid: u128) -> Option<Nbt> {
-        None
+    fn marker_custom_data(&mut self, dim: &str, uuid: u128) -> Option<Nbt> {
+        self.level_markers(dim)
+            .into_iter()
+            .find(|(found, _, _)| *found == uuid)
+            .map(|(_, _, data)| data)
     }
     fn send_payload(&mut self, player: u128, channel: &str, data: Vec<u8>) {
         self.send_raw(player, channel, &data);
@@ -2659,9 +2713,7 @@ impl IPayloadHandler for Inbox {
     }
 }
 
-/// The module file path for the glue of `MarkerData` (kept for the marker encoding path, which is unused until
-/// `level_markers` exists).
-#[allow(dead_code)]
+/// The encoded `MarkerData` of one marker, as `marker_snapshot` and the marker packets send it.
 fn encode_marker(uuid: u128, position: [f64; 3], data: &Nbt) -> Vec<u8> {
     let mut w = Writer::new();
     MarkerData::create_from(uuid, position, data).write(&mut w);
