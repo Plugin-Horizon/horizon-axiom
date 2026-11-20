@@ -10,5 +10,5 @@ capabilities = ["registries"]
 [native]
 # Development build of arismoko/horizon main plus mod API additions (see README).
 game = "26.3"
-horizon = "bc5753b57d0c2e7824aa98a953f9e64d19dad873"
+horizon = "5ef7734fdd854add5efd6817178be3c988d8d050"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
