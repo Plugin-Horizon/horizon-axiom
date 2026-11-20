@@ -1,5 +1,9 @@
 # horizon-axiom
 
+## Port status
+
+Compared with AxiomPaperPlugin (commit 69c1b0a) (estimate): **47 %** of the original's commands, permissions, config keys, messages and features work today; **54 %** once our open Horizon PRs are merged; **71 %** with the engine changes we are writing; **47 %** with the newest Horizon SDK. Estimated count: ~80/~170 items. Status: not yet compiled after the 2026-11-20 round.
+
 Unofficial Rust port of the server side of [Axiom](https://axiom.moulberry.com/) (AxiomPaperPlugin, MIT) for
 [Horizon](https://github.com/arismoko/horizon). Not affiliated with Moulberry; ported with their permission.
 
