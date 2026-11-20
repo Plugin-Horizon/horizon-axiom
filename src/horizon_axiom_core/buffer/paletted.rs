@@ -325,8 +325,8 @@ mod tests {
         assert!(read_section(&mut Reader::new(&fixed), 15, LongArrays::Counted).is_err());
     }
 
-    /// The cases of `tests/fixtures/vanilla_26_3/` (written by vanilla 26.3's `PalettedContainer.write` over a
-    /// 30000-entry id map, so 15 global bits; the generator is in the fixture folder's README).
+    /// The cases of the vanilla 26.3 fixtures (written by vanilla 26.3's `PalettedContainer.write` over a
+    /// 30000-entry id map, so 15 global bits; see `tests/fixtures/README.md`).
     fn vanilla_cases() -> Vec<(&'static str, fn(usize) -> u32)> {
         vec![
             ("single", |_| 7),
@@ -338,9 +338,15 @@ mod tests {
         ]
     }
 
+    /// Reads the vanilla 26.3 fixtures from `$AXIOM_VANILLA_FIXTURES` (generated locally, never committed).
+    /// Without the variable the test prints a note and returns early.
     #[test]
     fn reads_the_sections_vanilla_26_3_writes() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vanilla_26_3");
+        let Some(dir) = std::env::var_os("AXIOM_VANILLA_FIXTURES") else {
+            eprintln!("skipped: AXIOM_VANILLA_FIXTURES is not set (see tests/fixtures/README.md)");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
         for (name, f) in vanilla_cases() {
             let bytes = std::fs::read(dir.join(format!("{name}.bin"))).unwrap();
             let mut r = Reader::new(&bytes);

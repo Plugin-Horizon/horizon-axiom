@@ -4,3 +4,4 @@ AGENT-BRIEF.md
 /target
 /core/target
 .horizon/
+tests/fixtures/vanilla_26_3/*.bin
