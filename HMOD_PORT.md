@@ -1,5 +1,55 @@
 # hmod port: axiom
-Parity: 44% now / 51% with our PRs (75/170 items now, 87/170 with our PRs; the PR count is an estimate: 14 of the open items are named in GAPS_UPSTREAM.md, not checked one by one; NOT compiled or tested, written blind)
+Parity: 47% now / 54% with our PRs (80/170 items now, 92/170 with our PRs; the PR count is an estimate: 14 of the open items are named in GAPS_UPSTREAM.md, not checked one by one; NOT compiled or tested, written blind)
+
+Round 100% (2), written blind, not compiled
+- Fixed: `/axiompaperdebug` has one usage per `AxiomDebugCommand` literal (`canUseAxiom`, `isMismatchedDataVersion`, `canModifyWorld`, `isClientListening <channel>`, `hasPermission <permission>`, `getRestrictions`, `canBreakBlockAtCurrentPosition [plotsquared|worldguard]`, `canPlaceBlockAtCurrentPosition [plotsquared|worldguard]`, `isPlotWorld`, `getCurrentEditablePlot`), so the subcommands tab-complete. The handler rebuilds the subcommand line from the literal path and the text argument (`debug_input`); the core's answers are unchanged.
+- Fixed: `disallowed-blocks` (was read, never used). `restrictions/disallowed.rs` parses the entries (`minecraft:oak_stairs[waterlogged=true]`, a bare name for every state, a missing namespace means `minecraft`) and matches a state string; `block_state_from_wire` answers void air for a disallowed client state, as Java's client registry does. Tags (`#namespace:tag`) and entries Java's parser refuses are dropped.
+- Fixed: plugin.yml children. A node also holds when one of its wildcard parents is held as a typed node, so `axiom.default` gives `axiom.build.place` through `axiom.build.*` (`with_parents`, used by `refresh_permissions`). Bukkit does this through `children`; before, only the leaves LuckPerms answered counted.
+- Fixed: kick texts of the packet errors. A failing handler kicks with `Error while processing packet <channel>: <error>` (AxiomPaper's `WrapperPacketListener`; the error text is the core's, not Java's exception message). The zstd failure reads `Axiom: Zstd failed to decompress: <error>`. The block-change error keeps AxiomPaper's wording with the typo (`An error occured while processing block change: ...`), and a biome buffer that fails says `biome change`.
+- Gaps closed as API-blocked and written to GAPS_UPSTREAM.md (axiom lines): block entity type of a state, data fixers for old-version data, neighbour shape update and scheduled tick, region/plot protection query, anti-xray flag per player, cancellable physical trigger, entity type lookup by id, server protocol version and older-client block maps.
+- Unit tests (literal values): `with_parents` (parent grant reaches its children, a child grant does not grant its parent), `disallowed` (bare name, namespace, named properties, dropped entries, empty list, state splitting), and the lib-level disallowed check.
+
+Checklist round 100 (walked from plugin.yml, config.yml, AxiomPaper.java, commands/, packet/impl/, listener/, restrictions/)
+Commands
+- [x] `/axiompaperdebug`: 10 subcommands, the 4 that take a region or plot literal (2 each) and their replies (text as Java's `Component.text`).
+- [x] `/axiompaperdebug` sender check: op, `axiom.all`, `axiom.debug`, the debug UUID (kept as in the original, see Known gaps).
+- [ ] Brigadier `requires`: Java hides the usages from a sender who may not run them; the port lists them to everyone and the handler answers. Needs a node-based or predicate-based visibility in the command API (not in the reference); not closable here.
+- [x] `/axiompapermigrateconfig`: op (level 1) and console; messages as Java.
+- [ ] `canBreak/canPlaceBlockAtCurrentPosition plotsquared|worldguard`: the answers are the generic ones, the region plugins are API-blocked (GAPS_UPSTREAM.md).
+- [ ] `isPlotWorld` / `getCurrentEditablePlot`: always false / empty (PlotSquared API-blocked).
+Config keys (config.yml, all 24 keys including `limits`; `allow-large-chunk-data-request` is read by no Java code, so it has no behaviour on either side)
+- [x] Parsed with Java's defaults: the chunk, tunnel, world-filter, entity, marker, annotation, block and reach keys (`restrictions/config.rs`).
+- [x] `disallowed-blocks` (this round).
+- [x] `whitelist-world-regex` / `blacklist-world-regex` with Java's `matches` (full match, blank = off).
+- [x] `allow-teleport-between-worlds`, `blueprint-sharing` (the blueprint channels are served only when on), `allow-annotations`, `send-markers`, `disable-entity-sanitization`.
+- [x] `incompatible-data-version` / `unsupported-axiom-version` as kick / warn / ignore (unknown means kick).
+- [ ] `whitelist-entities` / `blacklist-entities`: applied, but Java drops names the registry does not know, the port keeps them (GAPS_UPSTREAM.md, entity type lookup).
+- [ ] `log-core-protect-changes`: parsed, nothing logged. Decision: CoreProtect is removed network-wide (CLAUDE.md).
+- [x] `limits.<key>.block-buffer-rate-limit` (`example` skipped) and `axiomlimits.<key>` as typed nodes.
+- [ ] `incompatible-data-version` with a client on another data version: `is_mismatched_data_version` is always false (no client data version in the port; API-blocked for the ViaVersion maps).
+Messages
+- [x] Handshake goodbyes and sends: outdated Axiom, server not updated, invalid handshake ID, missing `axiom.use`, data version, Axiom+ViaVersion, ViaVersion mismatch warning, `You don't have permission to use Axiom ...`.
+- [x] Kicks: split buffer too large, unregistered packet, packet too large, too fast, malformed tunnel buffer, packet error (this round).
+- [x] Tick block broadcast (`updated & ticked`, estimated time, `expect to be kicked`, `Done updating & ticking blocks`).
+- [x] Config migration texts (`No migration necessary`, backup, migrated, the internal errors) and the clickable hint.
+- [x] Blueprint feature text (`Axiom+ViaVersion: This feature isn't supported ...`).
+- [x] Deprecated `axiom.*` notice: text kept, unreachable (wildcards cannot be asked, see Known gaps).
+- [ ] Anti-xray warning: text kept, never sent (no anti-xray API, GAPS_UPSTREAM.md).
+Permission nodes
+- [x] Every leaf of plugin.yml declared, op default (level 1); `axiomadmin.bypass_region_checks` and `axiomlimits.*` at level 4.
+- [x] plugin.yml children (this round).
+- [ ] Explicit deny and wildcard queries (GAPS_UPSTREAM.md, tri-state query).
+Listeners and channels (packet/impl, listener, AxiomPaper.onEnable)
+- [x] Every serverbound channel is served when Java registers it (`served`: blueprint sharing, annotations).
+- [x] The 20 listeners map to the core's handlers; the permission each one checks is the same node name (`axiom.*` as in plugin.yml).
+- [ ] `NoPhysicalTriggerListener`: the cancel is API-blocked (GAPS_UPSTREAM.md).
+- [ ] Tick-blocks neighbour shape updates and block ticks: API-blocked.
+- [ ] Block entity type of a state, data fixers: API-blocked.
+- [ ] Entity spawn cancel and hanging facing: API-blocked (existing GAPS_UPSTREAM.md lines).
+- [ ] CoreProtect logging: not ported (decision, see above).
+Heightmaps, markers, world properties, custom blocks, displays
+- [x] Server heightmaps (round 2); markers listed with their custom data (round 2).
+- [ ] Markers hidden by Axiom's gizmo flag still listed (flag in core state).
 
 Round 2 (written blind, not compiled)
 - Fixed: colours. `send_message` maps `MessageColor` to the named colours `red` / `yellow` through `TextStyle::color`; the
