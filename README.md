@@ -40,11 +40,10 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 - Block states use the vanilla numbering derived at runtime from the engine's own block registry (`block_keys` in registry order, each block's `definition`, properties sorted by name, first one slowest); no game data table ships with the mod. A mod's blocks are unmapped. Block entity data is read and written; there is no block state data fixer, no block entity type of a state, and older clients are refused (no per-release block mapping).
 - Sections are read cell by cell; `update_from_neighbour_shapes` and the tick-blocks packet do nothing (no API).
 - No cancel hook for Axiom's entity spawns; hanging-entity facing is not read or set; markers cannot be listed.
-- Region and plot checks (WorldGuard-style) are not seen; messages are plain text without colours (the config-migration hint has no clickable button).
+- Region and plot checks (WorldGuard-style) are not seen.
 - The game protocol version and the mod data folder are approximated.
 - Permissions are typed nodes (every `axiom.*` leaf, `axiom.default`, `axiom.all`, `axiom.debug`, `axiomadmin.bypass_region_checks`, `axiomlimits.<key>`), op-default at level 1 as in `plugin.yml`. A typed query cannot tell an explicit deny from "not set", so explicit denies of a node are not sent to the client, and the wildcard nodes (`axiom.entity.*`, the deprecated `axiom.*`) cannot be queried: a wildcard grant reaches the leaf through the permission handler, and the deprecated-wildcard notice is not sent. `axiomadmin.bypass_region_checks` and `axiomlimits.<key>` default to level 4 (Bukkit: nobody / unset).
 - Answers are taken every 20 ticks, so a changed grant takes up to a second to apply.
-- `axiom:add_server_heightmap` is never sent.
 
 ## Licence
 

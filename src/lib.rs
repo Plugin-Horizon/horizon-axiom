@@ -17,8 +17,8 @@ use crate::horizon_axiom_core::buf::{BufError, Nbt, Reader, Writer};
 use crate::horizon_axiom_core::buffer::{zstd_compress, zstd_decompress};
 use crate::horizon_axiom_core::constants::CLIENTBOUND_CHANNELS;
 use crate::horizon_axiom_core::constants::{
-    CHANNEL_TUNNEL, SERVERBOUND_CHANNELS, TUNNEL_BUFFER_FLAG_FIRST, TUNNEL_BUFFER_FLAG_LAST,
-    TUNNEL_PACKET_FLAG_ZSTD_COMPRESSED,
+    CHANNEL_ADD_SERVER_HEIGHTMAP, CHANNEL_TUNNEL, SERVERBOUND_CHANNELS, TUNNEL_BUFFER_FLAG_FIRST,
+    TUNNEL_BUFFER_FLAG_LAST, TUNNEL_PACKET_FLAG_ZSTD_COMPRESSED,
 };
 use crate::horizon_axiom_core::custom::{
     self, CustomBlockRegistry, CustomDisplayRegistry, CustomHost, DebugHost,
@@ -58,6 +58,7 @@ use mod_api::{
     IPayloadContext, IPayloadHandler, PayloadBytes, PayloadHandleError, PayloadId, Registrar,
     RegistrationContext,
 };
+use mod_api::text::{TextClick, TextHover, TextStyle};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -303,6 +304,10 @@ thread_local! {
 static PERMISSION_TICKS: AtomicU32 = AtomicU32::new(0);
 /// `(added, removed)` top-level keys of the config file against the shipped default, as read at startup.
 static CONFIG_OUTDATED: Mutex<(usize, usize)> = Mutex::new((0, 0));
+
+/// `ServerHeightmaps`: the image files directly in `plugins/AxiomPaper/heightmaps` as `(file name, bytes)`. Java reads
+/// them once in `onEnable`; this port reads them at the first join.
+static SERVER_HEIGHTMAPS: OnceLock<Vec<(String, Vec<u8>)>> = OnceLock::new();
 
 /// Every node name this mod asks about: the core's non-wildcard `axiom.*` nodes (a typed node cannot carry a `*`;
 /// grants of a wildcard reach the leaf through the permission handler), `axiom.debug`, the region bypass and one
@@ -750,7 +755,7 @@ fn route(
     Ok(())
 }
 
-/// What Java's `AxiomPaper.sendInitialPackets` sends once a player is active. Heightmaps are not sent (GAP).
+/// What Java's `AxiomPaper.sendInitialPackets` sends once a player is active.
 fn send_initial(host: &mut AxiomHost<'_>, state: &mut AxiomState, player: u128) {
     let dim = host
         .dimension_of(player)
@@ -760,15 +765,14 @@ fn send_initial(host: &mut AxiomHost<'_>, state: &mut AxiomState, player: u128) 
     if let Err(e) = blueprint::send_manifest(host, &state.blueprints, &[player]) {
         log(&format!("WARN blueprint manifest for {player:032x}: {e:?}"));
     }
+    send_heightmaps(host, player);
     if let Err(e) = annotation::send_all(host, &mut state.annotations, &dim, player) {
         log(&format!("WARN annotations for {player:032x}: {e:?}"));
     }
     state.custom_blocks.on_player_join(host, player);
     state.custom_displays.on_player_join(host, player);
     if is_op_level(&*host.host, player) {
-        for line in outdated_config_notice() {
-            host.tell(player, &line);
-        }
+        send_outdated_notice(host, player);
     }
 }
 
@@ -898,9 +902,12 @@ impl<'a> AxiomHost<'a> {
     }
 
     fn tell(&mut self, player: u128, text: &str) {
-        // TODO(arismoko-api: text_colour): colours are dropped; every line is plain text.
+        self.tell_text(player, Text::literal(text));
+    }
+
+    fn tell_text(&mut self, player: u128, text: Text) {
         if let Some(p) = self.player(player) {
-            let _ = p.tell(&mut *self.host, Text::literal(text));
+            let _ = p.tell(&mut *self.host, text);
         }
     }
 
@@ -1196,8 +1203,12 @@ impl RestrictionsHost for AxiomHost<'_> {
     fn send_payload(&mut self, player: u128, channel: &str, data: Vec<u8>) {
         self.send_raw(player, channel, &data);
     }
-    fn send_message(&mut self, player: u128, text: &str, _color: MessageColor) {
-        self.tell(player, text);
+    fn send_message(&mut self, player: u128, text: &str, color: MessageColor) {
+        let colour = match color {
+            MessageColor::Red => "red",
+            MessageColor::Yellow => "yellow",
+        };
+        self.tell_text(player, coloured(text, colour));
     }
     fn kick(&mut self, player: u128, reason: &str) {
         self.kick_player(player, reason);
@@ -2321,35 +2332,40 @@ impl DebugHost for AxiomHost<'_> {
 
 /// `AxiomPaper.migrateConfig`: backs `config.yml` up to `config.yml.bak`, then rewrites it as the shipped default
 /// with the values it sets. The answer lines, in order.
-fn migrate_config() -> Vec<String> {
+fn migrate_config() -> Vec<Text> {
     let (added, removed) = *CONFIG_OUTDATED.lock().unwrap_or_else(|e| e.into_inner());
     if added == 0 && removed == 0 {
-        return vec!["No migration necessary".to_owned()];
+        return vec![coloured("No migration necessary", "yellow")];
     }
     let path = original_path(Path::new("."));
     let Ok(current) = std::fs::read_to_string(&path) else {
-        return vec!["Internal error: config.yml doesn't exist".to_owned()];
+        return vec![coloured("Internal error: config.yml doesn't exist", "red")];
     };
     let backup = path.with_file_name("config.yml.bak");
     if std::fs::copy(&path, &backup).is_err() {
-        return vec!["Internal error: couldn't backup existing config".to_owned()];
+        return vec![coloured("Internal error: couldn't backup existing config", "red")];
     }
     *CONFIG_OUTDATED.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0);
-    let mut lines = vec!["Successfully backed up current config to config.yml.bak".to_owned()];
+    let mut lines = vec![coloured(
+        "Successfully backed up current config to config.yml.bak",
+        "green",
+    )];
     let migrated = config_migrate::migrate(config_migrate::DEFAULT_CONFIG, &current);
     if std::fs::write(&path, migrated).is_err() {
-        lines.push("Internal error: failed to save migrated config.yml".to_owned());
+        lines.push(coloured("Internal error: failed to save migrated config.yml", "red"));
         return lines;
     }
-    lines.push("Successfully migrated config.yml".to_owned());
+    lines.push(coloured("Successfully migrated config.yml", "green"));
     lines
 }
 
-/// The lines an operator is told once Axiom is active when the config file lags the shipped default.
-fn outdated_config_notice() -> Vec<String> {
+/// The two lines an operator is sent once Axiom is active when the config file lags the shipped default: the summary
+/// in yellow, then a green bold "CLICK HERE" that runs `/axiompapermigrateconfig` (hover shows the command), as in
+/// `AxiomPaper`'s join handler.
+fn send_outdated_notice(host: &mut AxiomHost<'_>, player: u128) {
     let (added, removed) = *CONFIG_OUTDATED.lock().unwrap_or_else(|e| e.into_inner());
     if added == 0 && removed == 0 {
-        return Vec::new();
+        return;
     }
     let mut parts = Vec::new();
     if added != 0 {
@@ -2358,10 +2374,81 @@ fn outdated_config_notice() -> Vec<String> {
     if removed != 0 {
         parts.push(format!("{removed} removed entries"));
     }
-    vec![
-        format!("Axiom: Plugin config is outdated ({})", parts.join(", ")),
-        "Run /axiompapermigrateconfig to migrate the config".to_owned(),
-    ]
+    let summary = format!("Axiom: Plugin config is outdated ({})", parts.join(", "));
+    host.tell_text(player, coloured(&summary, "yellow"));
+
+    let mut click = TextStyle::default();
+    click.color = Some("green".to_owned());
+    click.bold = Some(true);
+    click.click = Some(TextClick::RunCommand("/axiompapermigrateconfig".to_owned()));
+    click.hover = Some(TextHover::Text(Box::new(Text::literal(
+        "/axiompapermigrateconfig",
+    ))));
+    let hint = Text::literal("CLICK HERE")
+        .with_style(click)
+        .append(coloured(" to migrate the config", "yellow"));
+    host.tell_text(player, hint);
+}
+
+/// A chat line in a named colour (`red`, `yellow`, `green`), as `Component.text(..).color(..)`.
+fn coloured(text: &str, colour: &str) -> Text {
+    let mut style = TextStyle::default();
+    style.color = Some(colour.to_owned());
+    Text::literal(text).with_style(style)
+}
+
+/// The image files of `dir` (top level only) as `(name, bytes)`, in name order. A file that is not an image, or
+/// is over 2,000,000 bytes, is left out, as `ServerHeightmaps.load` does.
+fn load_server_heightmaps(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    paths.sort();
+    let mut maps = Vec::new();
+    for path in paths {
+        // A directory does not read as a file, so it is skipped as `ImageIO.read` skips it.
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if !looks_like_image(&bytes) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        if bytes.len() > 2_000_000 {
+            log(&format!("Heightmap {name} skipped because it's over 2mb"));
+            continue;
+        }
+        maps.push((name, bytes));
+    }
+    maps
+}
+
+/// The formats `ImageIO.read` decodes by default (PNG, JPEG, GIF, BMP), by their leading bytes. The file is not
+/// decoded, so a damaged image with a valid header is sent where Java would skip it.
+fn looks_like_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || bytes.starts_with(b"BM")
+}
+
+/// `ServerHeightmaps.sendTo`: one `axiom:add_server_heightmap` payload per file, the name then the bytes.
+fn send_heightmaps(host: &mut AxiomHost<'_>, player: u128) {
+    let maps = SERVER_HEIGHTMAPS.get_or_init(|| {
+        load_server_heightmaps(&Path::new(".").join("plugins").join("AxiomPaper").join("heightmaps"))
+    });
+    for (name, bytes) in maps {
+        let mut out = Writer::new();
+        out.write_string(name);
+        out.write_byte_array(bytes);
+        host.send_raw(player, CHANNEL_ADD_SERVER_HEIGHTMAP, &out.into_bytes());
+    }
 }
 
 /// `/axiompaperdebug`: the core's `debug_command` answers the subcommands, for an operator or a player with axiom.*.
@@ -2497,7 +2584,7 @@ impl Hooks for Mod {
         match event.command.literals.first().map(String::as_str) {
             Some("axiompapermigrateconfig") => {
                 for line in migrate_config() {
-                    reply(host, line);
+                    let _ = host.commands().feedback(line);
                 }
                 Flow::Cancel
             }
@@ -2584,6 +2671,22 @@ fn encode_marker(uuid: u128, position: [f64; 3], data: &Nbt) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heightmap_files_are_recognised_by_their_leading_bytes() {
+        assert!(looks_like_image(b"\x89PNG\r\n\x1a\nrest"));
+        assert!(looks_like_image(&[0xFF, 0xD8, 0xFF, 0xE0]));
+        assert!(looks_like_image(b"GIF89a...."));
+        assert!(looks_like_image(b"BM...."));
+        assert!(!looks_like_image(b"\x89PNG"));
+        assert!(!looks_like_image(b"name: not an image"));
+        assert!(!looks_like_image(b""));
+    }
+
+    #[test]
+    fn a_missing_heightmap_folder_gives_no_files() {
+        assert!(load_server_heightmaps(Path::new("/nonexistent/axiom/heightmaps")).is_empty());
+    }
 
     #[test]
     fn declared_nodes_have_no_wildcards_and_no_free_nodes() {

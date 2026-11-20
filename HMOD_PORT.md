@@ -1,5 +1,17 @@
 # hmod port: axiom
-Parity: before 35% -> after 41% (70/170 items; method: audit counts of the earlier round, +10 items for block writes, section reads, block entity read/write, blueprint states and the state classification; NOT compiled or tested, written blind)
+Parity: 43% now / 52% with our PRs (73/170 items now, 88/170 with our PRs; the PR count is an estimate: 15 of the open items are named in GAPS_UPSTREAM.md, not checked one by one; NOT compiled or tested, written blind)
+
+Round 2 (written blind, not compiled)
+- Fixed: colours. `send_message` maps `MessageColor` to the named colours `red` / `yellow` through `TextStyle::color`; the
+  join notice and `/axiompapermigrateconfig` lines use the colours of AxiomPaper (yellow, red, green). Plain `tell` is unchanged.
+- Fixed: the config-migration hint is clickable: a green bold "CLICK HERE" with `RunCommand("/axiompapermigrateconfig")` and the
+  command as hover text, then yellow " to migrate the config", as `AxiomPaper`'s join handler.
+- Fixed: server heightmaps. Image files directly in `plugins/AxiomPaper/heightmaps` are read at the first join (Java: at enable), files over
+  2,000,000 bytes are skipped with the same log line, and each is sent as `axiom:add_server_heightmap` (name, then bytes) after the
+  blueprint manifest, as `sendTo`. Image test: the leading bytes of PNG, JPEG, GIF and BMP, not a decode, so a damaged image with a valid
+  header is sent where Java skips it.
+- Unit tests: `looks_like_image` (literal bytes) and the missing-folder case of `load_server_heightmaps`.
+- Still open (see round 100%): markers, region checks, explicit deny, wildcard nodes, entity spawn cancel, hanging facing, the API items in GAPS_UPSTREAM.md.
 
 Round 100%
 - Fixed: `block_state_from_wire` no longer refuses every state. `src/block_ids.rs` derives the vanilla numeric block state ids at runtime from the engine's block registry (`block_keys()` order, `block_states().definition(block)` properties sorted by name, first slowest; built lazily on the first `AxiomHost`, cached; only `minecraft:` blocks are numbered; no Mojang data table in the repo). Risk: the numbering is right only if the registry order and each property's value order match vanilla's (see GAPS_UPSTREAM.md); vanilla 26.3 should give 35723 states / 16 global bits. Ids convert to engine states through `block_state_id(string)` and back through the block's name and properties, cached per thread.
