@@ -6,6 +6,7 @@
 //! Fail-closed rule: where a write or a reply has no API, the write is refused and the reply is not sent, so the
 //! Axiom client never gets a handshake and nothing in the world changes.
 
+mod block_ids;
 mod config_migrate;
 pub mod horizon_axiom_core;
 use crate::horizon_axiom_core::annotation::{
@@ -43,7 +44,9 @@ use crate::horizon_axiom_core::world::packets::{set_fly_speed, set_gamemode, set
 use crate::horizon_axiom_core::world::{
     GameMode as CoreGameMode, Location, MarkerEntry, WorldHost, WorldState,
 };
+use crate::block_ids::{BlockTable, RegistryBlock};
 use mod_api::{
+    BlockMetadata, BlockState as HostState, BlockUpdateFlags, HostBlockStates, StateConstraint,
     ChunkRef, Command, CommandArgumentValue, Compound, Config, ConfigFile, ConfigKind,
     ConfigLoadingEvent, ConfigReloadingEvent, EntityRef, Flow, GameMode, GameRuleValue, Hooks,
     HostSide, LevelRef, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode,
@@ -85,9 +88,43 @@ static CHUNK_CONTROLLER: OnceLock<TicketController> = OnceLock::new();
 /// Set once the tickets an earlier run left in the saves have been released.
 static OLD_TICKETS_RELEASED: AtomicBool = AtomicBool::new(false);
 
-/// Stands in for every block state id until arismoko exposes the game's numeric state ids (see `block_state_from_wire`).
-/// Writes never reach it, because no wire id maps to a state yet.
+/// The state id (air) a block the vanilla table does not know, such as a mod's block, reads as.
 const UNMAPPED_STATE: u32 = 0;
+
+/// The engine's process-local block states as the numeric ids the wire format uses, kept per thread because the
+/// conversion goes through the game's property tables.
+#[derive(Default)]
+struct StateCache {
+    to_host: HashMap<u32, Option<HostState>>,
+    from_host: HashMap<HostState, u32>,
+    has_block_entity: HashMap<u32, bool>,
+}
+
+thread_local! {
+    static STATE_CACHE: RefCell<StateCache> = RefCell::new(StateCache::default());
+}
+
+/// The engine's update flags for the Java `Block.UPDATE_*` bits the core passes (`IMMEDIATE`, 8, has no counterpart).
+fn update_flags(bits: u32) -> BlockUpdateFlags {
+    const MAP: [(u32, BlockUpdateFlags); 9] = [
+        (1, BlockUpdateFlags::NEIGHBORS),
+        (2, BlockUpdateFlags::CLIENTS),
+        (4, BlockUpdateFlags::INVISIBLE),
+        (16, BlockUpdateFlags::KNOWN_SHAPE),
+        (32, BlockUpdateFlags::SUPPRESS_DROPS),
+        (64, BlockUpdateFlags::MOVE_BY_PISTON),
+        (128, BlockUpdateFlags::SKIP_SHAPE_UPDATE_ON_WIRE),
+        (256, BlockUpdateFlags::SKIP_BLOCK_ENTITY_SIDE_EFFECTS),
+        (512, BlockUpdateFlags::SKIP_ON_PLACE),
+    ];
+    MAP.iter()
+        .filter(|(bit, _)| bits & bit != 0)
+        .fold(BlockUpdateFlags::NONE, |acc, (_, flag)| acc | *flag)
+}
+
+/// The flags of a raw section write: the clients hear of it, nothing else runs (Java `setBlockState` on the section,
+/// then `blockChanged`).
+const RAW_WRITE_BITS: u32 = 2 | 16 | 32 | 256 | 512;
 
 /// A random 64-bit value from the std hasher, which is seeded per process.
 fn random_u64() -> u64 {
@@ -775,6 +812,24 @@ struct AxiomHost<'a> {
 
 impl<'a> AxiomHost<'a> {
     fn new(host: &'a mut dyn ServerHost, active: BTreeSet<u128>, config: AxiomConfig) -> Self {
+        // The vanilla state numbering comes from the engine's registry: block keys in registry order (vanilla's
+        // first), each with its properties and legal values.
+        BlockTable::ensure(|| {
+            let meta = host.block_states();
+            host.block_keys()
+                .into_iter()
+                .filter_map(|key| {
+                    let id = meta.name(key).ok()?.to_owned();
+                    let properties = meta
+                        .definition(key)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|p| (p.name, p.values))
+                        .collect();
+                    Some(RegistryBlock { id, properties })
+                })
+                .collect()
+        });
         let filter = EntityTypeFilter::new(
             config.whitelist_entities.clone(),
             config.blacklist_entities.clone(),
@@ -925,12 +980,53 @@ impl<'a> AxiomHost<'a> {
         );
     }
 
-    /// The block state at `pos`, from a loaded chunk. Every state reads as `UNMAPPED_STATE` (see `block_state_from_wire`).
+    /// The engine state the numeric state id `id` names, `None` for an id the game has no block for.
+    fn state_to_host(&self, id: StateId) -> Option<HostState> {
+        if let Some(hit) = STATE_CACHE.with(|c| c.borrow().to_host.get(&id).copied()) {
+            return hit;
+        }
+        let resolved = BlockTable::get()
+            .state_string(id)
+            .and_then(|text| self.host.block_state_id(&text));
+        STATE_CACHE.with(|c| c.borrow_mut().to_host.insert(id, resolved));
+        resolved
+    }
+
+    /// The numeric state id of an engine state, `UNMAPPED_STATE` for a block outside the vanilla table.
+    fn state_from_host(&self, state: HostState) -> StateId {
+        if let Some(hit) = STATE_CACHE.with(|c| c.borrow().from_host.get(&state).copied()) {
+            return hit;
+        }
+        let meta = self.host.block_states();
+        let id = meta
+            .name(state.block())
+            .ok()
+            .and_then(|name| {
+                let values: Vec<(String, String)> = meta
+                    .definition(state.block())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|p| {
+                        let value = state.property(&meta, &p.name).ok().flatten()?.to_owned();
+                        Some((p.name, value))
+                    })
+                    .collect();
+                let refs: Vec<(&str, &str)> =
+                    values.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                BlockTable::get().id_of(name, &refs)
+            })
+            .unwrap_or(UNMAPPED_STATE);
+        STATE_CACHE.with(|c| c.borrow_mut().from_host.insert(state, id));
+        id
+    }
+
+    /// The block state at `pos`, from a loaded chunk.
     fn state_at(&self, dim: &str, pos: [i32; 3]) -> Option<StateId> {
         if !self.chunk_loaded(dim, pos[0] >> 4, pos[2] >> 4) {
             return None;
         }
-        Some(UNMAPPED_STATE)
+        let state = self.level(dim)?.block_state(&*self.host, pos)?;
+        Some(self.state_from_host(state))
     }
 
     /// Indexes the entities of `dim` by uuid, for the calls of this host. Every entity of the level is visited.
@@ -968,10 +1064,53 @@ impl<'a> AxiomHost<'a> {
             .find(|tree| tree.nodes.iter().any(|node| node.uuid == uuid))
     }
 
-    /// Reads a section of the chunk. TODO(arismoko-api: chunk_section_read): arismoko has `read_columns` with a
-    /// different shape, so sections read as missing and the request gets no blocks.
-    fn section_read(&self, _dimension: &str, _cx: i32, _sy: i32, _cz: i32) -> SectionRead {
-        SectionRead::Missing
+    /// The block entity at `pos` as `saveWithId` writes it: its data with `id` and the position.
+    fn saved_block_entity(&mut self, dim: &str, pos: [i32; 3]) -> Option<Nbt> {
+        let level = self.level(dim)?;
+        let entity = self.host.block_entity(level, pos)?;
+        let data = entity.data(&*self.host)?;
+        let Nbt::Compound(mut map) = tag_to_core(&Tag::Compound(data)) else { return None };
+        if let Some(kind) = entity.kind(&*self.host) {
+            map.insert("id".to_owned(), Nbt::String(kind.id(&*self.host).to_string()));
+        }
+        map.insert("x".to_owned(), Nbt::Int(pos[0]));
+        map.insert("y".to_owned(), Nbt::Int(pos[1]));
+        map.insert("z".to_owned(), Nbt::Int(pos[2]));
+        Some(Nbt::Compound(map))
+    }
+
+    /// Reads a section of the chunk cell by cell (no section read API; `read_columns` is column shaped).
+    fn section_read(&self, dimension: &str, cx: i32, sy: i32, cz: i32) -> SectionRead {
+        if !self.chunk_loaded(dimension, cx, cz) {
+            return SectionRead::Missing;
+        }
+        let (min_section, max_section) = SetBlockHost::section_y_range(self, dimension);
+        if sy < min_section || sy > max_section {
+            return SectionRead::Missing;
+        }
+        let Some(level) = self.level(dimension) else {
+            return SectionRead::Missing;
+        };
+        let table = BlockTable::get();
+        let mut states = Box::new([UNMAPPED_STATE; 4096]);
+        let mut only_air = true;
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let pos = [cx * 16 + x, sy * 16 + y, cz * 16 + z];
+                    let id = level
+                        .block_state(&*self.host, pos)
+                        .map_or(UNMAPPED_STATE, |s| self.state_from_host(s));
+                    only_air &= table.is_air(id);
+                    states[((y << 8) | (z << 4) | x) as usize] = id;
+                }
+            }
+        }
+        if only_air {
+            SectionRead::Empty
+        } else {
+            SectionRead::Blocks(states)
+        }
     }
 }
 
@@ -1345,48 +1484,62 @@ impl SetBlockHost for AxiomHost<'_> {
     fn max_chunk_load_distance(&self, _dim: &str) -> i32 {
         self.config.max_chunk_load_distance_for(false)
     }
-    fn block_state_from_wire(&self, _player: u128, _wire_id: i32) -> Option<u32> {
-        // TODO(arismoko-api: block_state_registry_id): arismoko's BlockState is process-local, with no numeric id that the
-        // client's wire ids can map to. Every edit that names a state is refused here, so nothing is written.
-        None
+    fn block_state_from_wire(&self, _player: u128, wire_id: i32) -> Option<u32> {
+        // The client's ids are the vanilla 26.3 numbering, which `BlockTable` rebuilds. An id the game has no block
+        // for (a mod's) is refused.
+        let id = u32::try_from(wire_id).ok()?;
+        self.state_to_host(id)?;
+        Some(id)
     }
-    fn is_air(&self, _state: u32) -> bool {
-        true
+    fn is_air(&self, state: u32) -> bool {
+        BlockTable::get().is_air(state)
     }
     fn empty_state(&self) -> u32 {
-        UNMAPPED_STATE
+        BlockTable::get().void_air()
     }
     fn global_bits(&self) -> u8 {
-        // TODO(arismoko-api: block_state_registry_size): vanilla 26.3 width, assumed.
-        15
+        BlockTable::get().global_bits()
     }
     fn same_block(&self, a: u32, b: u32) -> bool {
-        a == b
+        let table = BlockTable::get();
+        a == b || (table.block_index(a).is_some() && table.block_index(a) == table.block_index(b))
     }
     fn state_can_be_replaced(&self, state: u32) -> bool {
-        self.is_air(state)
+        match self.state_to_host(state) {
+            Some(hs) => self.host.block_states().replaceable(hs).unwrap_or(false),
+            None => self.is_air(state),
+        }
     }
-    fn has_block_entity(&self, _state: u32) -> bool {
-        false
+    fn has_block_entity(&self, state: u32) -> bool {
+        if let Some(hit) = STATE_CACHE.with(|c| c.borrow().has_block_entity.get(&state).copied()) {
+            return hit;
+        }
+        let has = self
+            .state_to_host(state)
+            .and_then(|hs| self.host.block_states().has_block_entity(hs))
+            .unwrap_or(false);
+        STATE_CACHE.with(|c| c.borrow_mut().has_block_entity.insert(state, has));
+        has
     }
-    fn fluid_is_empty(&self, _state: u32) -> bool {
-        true
+    fn fluid_is_empty(&self, state: u32) -> bool {
+        BlockTable::get().fluid_is_empty(state)
     }
-    fn is_liquid_block(&self, _state: u32) -> bool {
-        false
+    fn is_liquid_block(&self, state: u32) -> bool {
+        BlockTable::get().is_liquid_block(state)
     }
-    fn is_bed_double_plant_or_door(&self, _state: u32) -> bool {
-        false
+    fn is_bed_double_plant_or_door(&self, state: u32) -> bool {
+        BlockTable::get().is_bed_double_plant_or_door(state)
     }
     fn light_properties_differ(&self, old: u32, new: u32) -> bool {
         old != new
     }
     fn block_entity_must_be_removed(&self, _old: u32, _new: u32) -> bool {
+        // The engine's write drops the old block entity and makes the new block's own (no remove call exists).
         false
     }
-    fn is_game_master_block(&self, _dim: &str, _pos: BlockPos) -> bool {
-        // TODO(arismoko-api: block_state_names): the name-based check needs the state's block name, which is not mapped.
-        false
+    fn is_game_master_block(&self, dim: &str, pos: BlockPos) -> bool {
+        self.state_at(dim, [pos.0, pos.1, pos.2])
+            .is_some_and(|state| BlockTable::get().is_game_master_block(state))
     }
     fn update_from_neighbour_shapes(&self, _dim: &str, _pos: BlockPos, state: u32) -> u32 {
         state
@@ -1421,10 +1574,22 @@ impl SetBlockHost for AxiomHost<'_> {
         self.state_at(dim, [pos.0, pos.1, pos.2])
             .unwrap_or(UNMAPPED_STATE)
     }
-    fn set_block_raw(&mut self, _dim: &str, _pos: BlockPos, _state: u32) -> u32 {
-        // Unreachable while `block_state_from_wire` refuses every state (TODO(arismoko-api: block_state_registry_id)).
-        UNMAPPED_STATE
+    fn set_block_raw(&mut self, dim: &str, pos: BlockPos, state: u32) -> u32 {
+        let old = self.block_state(dim, pos);
+        if old == state {
+            return old;
+        }
+        if let (Some(level), Some(hs)) = (self.level(dim), self.state_to_host(state)) {
+            let _ = level.set_block(
+                &mut *self.host,
+                [pos.0, pos.1, pos.2],
+                hs,
+                update_flags(RAW_WRITE_BITS),
+            );
+        }
+        old
     }
+    // The engine's write keeps the heightmaps.
     fn update_heightmaps(&mut self, _dim: &str, _pos: BlockPos, _new_state: u32) {}
     fn mark_chunk_unsaved(&mut self, _dim: &str, _cx: i32, _cz: i32) {}
     fn mark_block_changed(&mut self, dim: &str, pos: BlockPos) {
@@ -1453,13 +1618,20 @@ impl SetBlockHost for AxiomHost<'_> {
             None => false,
         }
     }
-    fn load_block_entities(&mut self, _dim: &str, entries: &[(BlockPos, Vec<u8>)]) {
-        // TODO(arismoko-api: block_entity_nbt_write): edit_blocks takes no NBT on arismoko, so block entities are dropped.
-        if !entries.is_empty() {
-            log(&format!(
-                "{} block entit(ies) not written: TODO(arismoko-api: block_entity_nbt_write)",
-                entries.len()
-            ));
+    fn load_block_entities(&mut self, dim: &str, entries: &[(BlockPos, Vec<u8>)]) {
+        let Some(level) = self.level(dim) else { return };
+        for (pos, bytes) in entries {
+            let Ok(Nbt::Compound(new)) = Reader::new(bytes).read_nbt() else { continue };
+            let at = [pos.0, pos.1, pos.2];
+            let Some(entity) = self.host.block_entity(level, at) else { continue };
+            // `loadWithComponents` keeps what the data does not name.
+            let mut data: Compound = entity.data(&*self.host).unwrap_or_default();
+            if let Tag::Compound(overlay) = core_to_tag(&Nbt::Compound(new)) {
+                for (k, v) in overlay.iter() {
+                    data.insert(k.clone(), v.clone());
+                }
+            }
+            let _ = entity.replace_data(&mut *self.host, data);
         }
     }
     fn send_chunk(&mut self, _dim: &str, _cx: i32, _cz: i32) {}
@@ -1553,8 +1725,10 @@ impl SetBlockHost for AxiomHost<'_> {
         _state: u32,
     ) {
     }
-    fn set_block(&mut self, _dim: &str, _pos: BlockPos, _state: u32, _flags: u32) {
-        // Unreachable while `block_state_from_wire` refuses every state (TODO(arismoko-api: block_state_registry_id)).
+    fn set_block(&mut self, dim: &str, pos: BlockPos, state: u32, flags: u32) {
+        if let (Some(level), Some(hs)) = (self.level(dim), self.state_to_host(state)) {
+            let _ = level.set_block(&mut *self.host, [pos.0, pos.1, pos.2], hs, update_flags(flags));
+        }
     }
     fn tick_fluid(&mut self, _dim: &str, _pos: BlockPos, _state: u32) {}
     fn tick_block(&mut self, _dim: &str, _pos: BlockPos, _state: u32) {}
@@ -1883,19 +2057,33 @@ impl RequestHost for AxiomHost<'_> {
     ) -> SectionRead {
         self.section_read(dimension, chunk_x, section_y, chunk_z)
     }
-    fn block_entity_nbt(&mut self, _dimension: &str, _x: i32, _y: i32, _z: i32) -> Option<Nbt> {
-        // TODO(arismoko-api: block_entity_nbt_read): block entity NBT is not readable here yet.
-        None
+    fn block_entity_nbt(&mut self, dimension: &str, x: i32, y: i32, z: i32) -> Option<Nbt> {
+        self.saved_block_entity(dimension, [x, y, z])
     }
     fn section_block_entities(
         &mut self,
-        _dimension: &str,
-        _chunk_x: i32,
-        _section_y: i32,
-        _chunk_z: i32,
+        dimension: &str,
+        chunk_x: i32,
+        section_y: i32,
+        chunk_z: i32,
     ) -> Vec<(i32, i32, i32, Nbt)> {
-        // TODO(arismoko-api: block_entity_nbt_read): as `block_entity_nbt`.
-        Vec::new()
+        let Some(level) = self.level(dimension) else { return Vec::new() };
+        let mut found = Vec::new();
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let pos = [chunk_x * 16 + x, section_y * 16 + y, chunk_z * 16 + z];
+                    let Some(state) = level.block_state(&*self.host, pos) else { continue };
+                    if !SetBlockHost::has_block_entity(self, self.state_from_host(state)) {
+                        continue;
+                    }
+                    if let Some(nbt) = self.saved_block_entity(dimension, pos) {
+                        found.push((pos[0], pos[1], pos[2], nbt));
+                    }
+                }
+            }
+        }
+        found
     }
     fn entity_info(&self, dimension: &str, uuid: u128) -> Option<EntityInfo> {
         let (dim, entity) = self.entities.get(&uuid)?;
@@ -1919,39 +2107,77 @@ impl RequestHost for AxiomHost<'_> {
 
 impl BlueprintHost for AxiomHost<'_> {
     fn data_version(&self) -> i32 {
-        0
+        self.host.server_data_version()
     }
-    fn default_state(&self, _block: &str) -> u32 {
-        UNMAPPED_STATE
+    fn default_state(&self, block: &str) -> u32 {
+        self.host
+            .block_state_id(block)
+            .map_or(UNMAPPED_STATE, |s| self.state_from_host(s))
     }
     fn global_state_bits(&self) -> u8 {
         self.global_bits()
     }
-    fn state_to_nbt(&self, _state: u32) -> Nbt {
-        // TODO(arismoko-api: block_state_numeric_id): a state id has no name here, so blueprints cannot save states.
-        Nbt::End
+    fn state_to_nbt(&self, state: u32) -> Nbt {
+        // `BlockState.CODEC`: `Name` and, when the block has properties, `Properties` (all values as strings).
+        let Some((block, values)) = BlockTable::get().describe(state) else { return Nbt::End };
+        let mut map = BTreeMap::new();
+        map.insert("Name".to_owned(), Nbt::String(format!("minecraft:{}", block.name)));
+        if !values.is_empty() {
+            let props = values
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), Nbt::String((*v).to_owned())))
+                .collect();
+            map.insert("Properties".to_owned(), Nbt::Compound(props));
+        }
+        Nbt::Compound(map)
     }
-    fn state_from_nbt(&self, _nbt: &Nbt) -> Option<u32> {
-        // TODO(arismoko-api: block_state_registry_id): blueprint states cannot be resolved, so they are refused.
-        None
+    fn state_from_nbt(&self, nbt: &Nbt) -> Option<u32> {
+        let Nbt::Compound(map) = nbt else { return None };
+        let Some(Nbt::String(name)) = map.get("Name") else { return None };
+        let mut text = name.clone();
+        if let Some(Nbt::Compound(props)) = map.get("Properties") {
+            let parts: Vec<String> = props
+                .iter()
+                .filter_map(|(k, v)| match v {
+                    Nbt::String(v) => Some(format!("{k}={v}")),
+                    _ => None,
+                })
+                .collect();
+            if !parts.is_empty() {
+                text = format!("{name}[{}]", parts.join(","));
+            }
+        }
+        // The game fills the properties the data leaves out with the block's defaults and refuses unknown ones.
+        let state = self.host.block_state_id(&text)?;
+        Some(self.state_from_host(state))
     }
     fn block_entity_type_of(&self, _state: u32) -> Option<String> {
+        // No API names the block entity type of a state (see GAPS_UPSTREAM.md).
         None
     }
-    fn block_entity_accepts(&self, _type_id: &str, _state: u32) -> bool {
-        false
+    fn block_entity_accepts(&self, _type_id: &str, state: u32) -> bool {
+        SetBlockHost::has_block_entity(self, state)
     }
-    fn upgrade_block_state(&self, _nbt: Nbt, _from_version: i32) -> Result<Nbt, String> {
-        Err("no block state data fixer on arismoko yet".to_owned())
+    fn upgrade_block_state(&self, nbt: Nbt, from_version: i32) -> Result<Nbt, String> {
+        if from_version == self.data_version() {
+            Ok(nbt)
+        } else {
+            Err("no block state data fixer available for an older data version".to_owned())
+        }
     }
-    fn upgrade_block_entity(&self, _nbt: Nbt, _from_version: i32) -> Result<Nbt, String> {
-        Err("no block entity data fixer on arismoko yet (TODO(arismoko-api: upgrade_block_entity_nbt))".to_owned())
+    fn upgrade_block_entity(&self, nbt: Nbt, from_version: i32) -> Result<Nbt, String> {
+        let Tag::Compound(data) = core_to_tag(&nbt) else { return Err("not a compound".to_owned()) };
+        self.host
+            .upgrade_block_entity_nbt(from_version, data)
+            .map(|c| tag_to_core(&Tag::Compound(c)))
+            .map_err(|e| format!("{e:?}"))
     }
-    fn upgrade_entity(&self, _nbt: Nbt, _from_version: i32) -> Result<Nbt, String> {
-        Err(
-            "no entity data fixer on arismoko yet (TODO(arismoko-api: upgrade_entity_nbt))"
-                .to_owned(),
-        )
+    fn upgrade_entity(&self, nbt: Nbt, from_version: i32) -> Result<Nbt, String> {
+        let Tag::Compound(data) = core_to_tag(&nbt) else { return Err("not a compound".to_owned()) };
+        self.host
+            .upgrade_entity_nbt(from_version, data)
+            .map(|c| tag_to_core(&Tag::Compound(c)))
+            .map_err(|e| format!("{e:?}"))
     }
     fn compress_block_entity(&self, raw: &[u8]) -> Vec<u8> {
         zstd_compress(raw)
@@ -2033,9 +2259,10 @@ impl CustomHost for AxiomHost<'_> {
     fn protocol_mismatch(&self, _player: u128) -> bool {
         false
     }
-    fn block_state_string(&self, _state: u32) -> String {
-        // TODO(arismoko-api: block_state_numeric_id): the name of a numeric state is not known yet.
-        "minecraft:air".to_owned()
+    fn block_state_string(&self, state: u32) -> String {
+        BlockTable::get()
+            .state_string(state)
+            .unwrap_or_else(|| "minecraft:air".to_owned())
     }
     fn send_payload(&mut self, player: u128, channel: &str, data: &[u8]) {
         self.send_raw(player, channel, data);
@@ -2389,5 +2616,20 @@ mod tests {
         assert!(held("axiom.use"));
         assert!(!held("axiom.default"));
         assert!(!held("axiom.entity.spawn"));
+    }
+}
+
+#[cfg(test)]
+mod block_state_tests {
+    use super::*;
+
+    #[test]
+    fn update_flags_map_the_java_bits() {
+        assert_eq!(update_flags(0).bits(), 0);
+        assert_eq!(update_flags(3).bits(), 3);
+        assert_eq!(update_flags(816).bits(), 816);
+        // IMMEDIATE (8) has no counterpart.
+        assert_eq!(update_flags(8).bits(), 0);
+        assert_eq!(update_flags(RAW_WRITE_BITS).bits(), 2 | 16 | 32 | 256 | 512);
     }
 }
