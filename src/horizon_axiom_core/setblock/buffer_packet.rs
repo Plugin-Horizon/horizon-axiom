@@ -66,6 +66,7 @@ pub fn handle_buffer_packet(
     let client_protocol = host.client_protocol(player);
     let framing = client_protocol.map_or(LongArrays::Fixed, LongArrays::for_protocol);
     let packet = parse_buffer_packet(r, host.empty_state(), host.client_global_bits(player), framing)?;
+    let biomes = matches!(packet, BufferPacket::Biomes { .. });
     let result = match packet {
         BufferPacket::Blocks { dim, mut buffer, dispatch_sends } => {
             // A client on another release sends its own state ids (Java: the ViaVersion-mapped registry).
@@ -85,7 +86,9 @@ pub fn handle_buffer_packet(
         }
     };
     if let Err(e) = result {
-        host.kick(player, &format!("An error occurred while processing block change: {e}"));
+        // AxiomPaper's wording, typo included (SetBlockBufferPacketListener: "An error occured while processing ...").
+        let what = if biomes { "biome change" } else { "block change" };
+        host.kick(player, &format!("An error occured while processing {what}: {e}"));
     }
     Ok(())
 }

@@ -7,6 +7,7 @@
 // through `RestrictionsHost`, which the game glue implements.
 
 mod config;
+pub mod disallowed;
 mod payload;
 mod permission;
 mod permission_set;

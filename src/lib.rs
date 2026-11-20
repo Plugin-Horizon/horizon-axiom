@@ -32,6 +32,7 @@ use crate::horizon_axiom_core::restrictions::{
     ALL_PERMISSIONS, AxiomHandshakeEvent, AxiomModifyWorldEvent, Config as AxiomConfig, MessageColor, PlotBounds,
     RestrictionsHost, RestrictionsState, original_path,
 };
+use crate::horizon_axiom_core::restrictions::disallowed::{is_disallowed, parse_all, Disallowed};
 use crate::horizon_axiom_core::setblock::block_packet::{BlockHit, Hand, handle_set_block};
 use crate::horizon_axiom_core::setblock::buffer_packet::handle_buffer_packet;
 use crate::horizon_axiom_core::setblock::dispatch::DispatchBudget;
@@ -357,11 +358,12 @@ fn refresh_permissions(host: &mut dyn ServerHost) -> Vec<u128> {
     let online = host.players().server_players();
     let mut fresh: HashMap<u128, BTreeSet<String>> = HashMap::new();
     for player in online {
-        let held: BTreeSet<String> = nodes
+        let own: BTreeSet<String> = nodes
             .iter()
             .filter(|n| player.permission_bool(host, &typed_node(n)).unwrap_or(false))
             .cloned()
             .collect();
+        let held = with_parents(&own);
         fresh.insert(player.uuid(), held);
     }
     PERMS.with(|cell| {
@@ -374,6 +376,27 @@ fn refresh_permissions(host: &mut dyn ServerHost) -> Vec<u128> {
         *old = fresh;
         changed
     })
+}
+
+/// Bukkit's plugin.yml `children`: a node also holds when one of its wildcard parents holds, so `axiom.default`
+/// gives `axiom.build.place` through `axiom.build.*`. A wildcard cannot be asked (`*` is not a typed node name), so
+/// only the parents the player holds as typed nodes count, and the chain is walked up to the root.
+fn with_parents(own: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut held = own.clone();
+    for permission in ALL_PERMISSIONS.iter().copied() {
+        if held.contains(permission.node()) {
+            continue;
+        }
+        let mut parent = permission.parent();
+        while let Some(ancestor) = parent {
+            if own.contains(ancestor.node()) {
+                held.insert(permission.node().to_owned());
+                break;
+            }
+            parent = ancestor.parent();
+        }
+    }
+    held
 }
 
 /// Refreshes the answers every `PERMISSION_REFRESH_TICKS` ticks, and at once when a player has none yet.
@@ -551,8 +574,9 @@ fn payload_in(
         return;
     }
     if let Err(e) = route(host, state, player, channel, data) {
+        // AxiomPaper's WrapperPacketListener: a failing handler kicks with the channel and the error.
         log(&format!("WARN {channel} from {player:032x}: {e}"));
-        host.kick_player(player, &format!("Axiom: Malformed {channel} packet"));
+        host.kick_player(player, &format!("Error while processing packet {channel}: {e}"));
     }
 }
 
@@ -640,7 +664,7 @@ fn tunnel_packet(host: &mut AxiomHost<'_>, state: &mut AxiomState, player: u128,
                 log(&format!(
                     "WARN {id} from {player:032x}: zstd tunnel packet: {e}"
                 ));
-                host.kick_player(player, "Axiom: Malformed tunnel packet");
+                host.kick_player(player, &format!("Axiom: Zstd failed to decompress: {e}"));
                 return;
             }
         }
@@ -649,7 +673,7 @@ fn tunnel_packet(host: &mut AxiomHost<'_>, state: &mut AxiomState, player: u128,
     };
     if let Err(e) = route(host, state, player, &id, &body) {
         log(&format!("WARN {id} from {player:032x}: {e}"));
-        host.kick_player(player, &format!("Axiom: Failed to read {id} packet"));
+        host.kick_player(player, &format!("Error while processing packet {id}: {e}"));
     }
 }
 
@@ -806,6 +830,8 @@ struct AxiomHost<'a> {
     active: BTreeSet<u128>,
     config: AxiomConfig,
     filter: EntityTypeFilter,
+    /// `disallowed-blocks` as parsed entries: a client's state matching one reads as void air (Java `DisallowedBlocks`).
+    disallowed: Vec<Disallowed>,
     /// Entities of the dimensions indexed for this call: client-visible uuid to (dimension, engine handle).
     entities: HashMap<u128, (String, EntityRef)>,
     /// The restrictions text of the player who runs `/axiompaperdebug`.
@@ -838,11 +864,13 @@ impl<'a> AxiomHost<'a> {
             config.whitelist_entities.clone(),
             config.blacklist_entities.clone(),
         );
+        let disallowed = parse_all(&config.disallowed_blocks);
         Self {
             host,
             active,
             config,
             filter,
+            disallowed,
             entities: HashMap::new(),
             debug_restrictions: None,
             pending: HashMap::new(),
@@ -1502,9 +1530,15 @@ impl SetBlockHost for AxiomHost<'_> {
     }
     fn block_state_from_wire(&self, _player: u128, wire_id: i32) -> Option<u32> {
         // The client's ids are the vanilla 26.3 numbering, which `BlockTable` rebuilds. An id the game has no block
-        // for (a mod's) is refused.
+        // for (a mod's) is refused. A state under `disallowed-blocks` reads as void air, as Java's client registry does.
         let id = u32::try_from(wire_id).ok()?;
         self.state_to_host(id)?;
+        if !self.disallowed.is_empty() {
+            let text = BlockTable::get().state_string(id)?;
+            if is_disallowed(&self.disallowed, &text) {
+                return Some(self.empty_state());
+            }
+        }
         Some(id)
     }
     fn is_air(&self, state: u32) -> bool {
@@ -2514,13 +2548,35 @@ fn debug(host: &mut dyn ServerHost, uuid: u128, args: &str) -> String {
         .unwrap_or_else(|| "This /axiompaperdebug subcommand is not known.".to_owned())
 }
 
-/// The text of a command's `args:text` argument, or empty.
-fn text_argument(event: &RunModCommandEvent<'_>, name: &str) -> String {
-    match event.command.argument(name) {
-        Some(CommandArgumentValue::String(s)) => s.clone(),
-        _ => String::new(),
+/// The subcommand line of `/axiompaperdebug`: the literals after the command name, then the text argument if the usage
+/// has one (`isClientListening <channel>`, `hasPermission <permission>`). Brigadier's `greedyString` takes the rest.
+fn debug_input(event: &RunModCommandEvent<'_>) -> String {
+    let mut parts: Vec<String> = event.command.literals.iter().skip(1).cloned().collect();
+    for argument in &event.command.arguments {
+        if let CommandArgumentValue::String(text) = &argument.value {
+            parts.push(text.clone());
+        }
     }
+    parts.join(" ")
 }
+
+/// One usage per `AxiomDebugCommand` literal, so the tab list shows the subcommands. The handler checks the sender.
+const DEBUG_USAGES: &[&str] = &[
+    "axiompaperdebug canUseAxiom",
+    "axiompaperdebug isMismatchedDataVersion",
+    "axiompaperdebug canModifyWorld",
+    "axiompaperdebug isClientListening <channel:text>",
+    "axiompaperdebug hasPermission <permission:text>",
+    "axiompaperdebug getRestrictions",
+    "axiompaperdebug canBreakBlockAtCurrentPosition",
+    "axiompaperdebug canBreakBlockAtCurrentPosition plotsquared",
+    "axiompaperdebug canBreakBlockAtCurrentPosition worldguard",
+    "axiompaperdebug canPlaceBlockAtCurrentPosition",
+    "axiompaperdebug canPlaceBlockAtCurrentPosition plotsquared",
+    "axiompaperdebug canPlaceBlockAtCurrentPosition worldguard",
+    "axiompaperdebug isPlotWorld",
+    "axiompaperdebug getCurrentEditablePlot",
+];
 
 /// Config text from the game (the registered TOML fallback, or nothing for the Paper file).
 fn config_file(file: &ConfigFile) -> bool {
@@ -2616,12 +2672,11 @@ impl Hooks for Mod {
     }
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
-        // The debug command takes an optional text argument (syntax `[args:text]`),
-        // so the bare form reaches the handler. Registered for every player: the handler checks op / axiom.debug
-        // itself (Java: the axiom.debug permission, not op only).
-        event
-            .commands
-            .push(Command::new("axiompaperdebug [args:text]"));
+        // Registered for every player: the handler checks op / axiom.debug / the debug UUID itself (Java: the
+        // axiom.debug permission, not op only, and Brigadier hides the usages from everyone else).
+        for usage in DEBUG_USAGES {
+            event.commands.push(Command::new(usage));
+        }
         event
             .commands
             .push(Command::op("axiompapermigrateconfig", 1));
@@ -2658,8 +2713,8 @@ impl Hooks for Mod {
                     );
                     return Flow::Cancel;
                 }
-                let args = text_argument(event, "args");
-                let text = debug(&mut *host, uuid, args.trim());
+                let input = debug_input(event);
+                let text = debug(&mut *host, uuid, input.trim());
                 reply(host, text);
                 Flow::Cancel
             }
@@ -2771,6 +2826,35 @@ mod tests {
         assert!(held("axiom.use"));
         assert!(!held("axiom.default"));
         assert!(!held("axiom.entity.spawn"));
+    }
+
+    #[test]
+    fn a_default_grant_reaches_its_plugin_yml_children() {
+        let own = BTreeSet::from(["axiom.default".to_owned()]);
+        let held = with_parents(&own);
+        assert!(held.contains("axiom.use"));
+        assert!(held.contains("axiom.build.place"));
+        assert!(held.contains("axiom.tool.stamp"));
+        assert!(held.contains("axiom.capability.no_clip"));
+        assert!(!held.contains("axiom.entity.spawn"));
+        assert!(!held.contains("axiom.debug"));
+    }
+
+    #[test]
+    fn a_child_grant_alone_does_not_grant_its_parent() {
+        let own = BTreeSet::from(["axiom.build.place".to_owned()]);
+        let held = with_parents(&own);
+        assert!(held.contains("axiom.build.place"));
+        assert!(!held.contains("axiom.default"));
+        assert!(!held.contains("axiom.use"));
+        assert!(!held.contains("axiom.build.section"));
+    }
+
+    #[test]
+    fn disallowed_wire_state_reads_as_void_air_in_the_core_list() {
+        let list = parse_all(&["minecraft:oak_stairs[waterlogged=true]".to_owned()]);
+        assert!(is_disallowed(&list, "minecraft:oak_stairs[facing=east,half=top,shape=straight,waterlogged=true]"));
+        assert!(!is_disallowed(&list, "minecraft:stone"));
     }
 }
 
