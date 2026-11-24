@@ -860,9 +860,15 @@ impl<'a> AxiomHost<'a> {
                 })
                 .collect()
         });
-        let filter = EntityTypeFilter::new(
-            config.whitelist_entities.clone(),
-            config.blacklist_entities.clone(),
+        let known: BTreeSet<String> = host
+            .entity_type_keys()
+            .into_iter()
+            .map(|key| key.id(&*host).to_string())
+            .collect();
+        let filter = EntityTypeFilter::from_config(
+            &config.whitelist_entities,
+            &config.blacklist_entities,
+            &known,
         );
         let disallowed = parse_all(&config.disallowed_blocks);
         Self {

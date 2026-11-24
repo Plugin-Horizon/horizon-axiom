@@ -187,6 +187,26 @@ impl EntityTypeFilter {
         }
     }
 
+    /// As `new`, with Java's config read: each name goes through `Identifier.parse` (a bare name is in the
+    /// `minecraft` namespace) and `BuiltInRegistries.ENTITY_TYPE.get(..).ifPresent`, so a name the registry does
+    /// not know is dropped (a misspelt whitelist entry then no longer blocks every entity type).
+    pub fn from_config(whitelist: &[String], blacklist: &[String], known: &BTreeSet<String>) -> Self {
+        let keep = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .map(|n| {
+                    if n.contains(':') {
+                        n.clone()
+                    } else {
+                        format!("minecraft:{n}")
+                    }
+                })
+                .filter(|n| known.contains(n))
+                .collect()
+        };
+        Self::new(keep(whitelist), keep(blacklist))
+    }
+
     /// `AxiomPaper.canEntityBeManipulated`: players never; whitelist if non-empty; never blacklisted.
     pub fn allows(&self, type_id: &str) -> bool {
         if type_id == TYPE_PLAYER {
@@ -1255,6 +1275,18 @@ mod tests {
         let w = EntityTypeFilter::new(vec!["minecraft:marker".to_string()], Vec::<String>::new());
         assert!(w.allows("minecraft:marker"));
         assert!(!w.allows("minecraft:armor_stand"));
+    }
+
+    #[test]
+    fn entity_type_filter_drops_unknown_names() {
+        let known: BTreeSet<String> = ["minecraft:marker", "minecraft:tnt"].iter().map(|s| s.to_string()).collect();
+        let w = vec!["marker".to_string(), "minecraft:typo".to_string()];
+        let f = EntityTypeFilter::from_config(&w, &["tnt".to_string()], &known);
+        assert!(f.allows("minecraft:marker"));
+        assert!(!f.allows("minecraft:armor_stand"));
+        assert!(!f.allows("minecraft:tnt"));
+        let only_typo = EntityTypeFilter::from_config(&["minecraft:typo".to_string()], &[], &known);
+        assert!(only_typo.allows("minecraft:armor_stand"));
     }
 
     fn uuid_bytes(out: &mut Vec<u8>, u: u128) {
