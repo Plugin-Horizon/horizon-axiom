@@ -923,7 +923,7 @@ impl<'a> AxiomHost<'a> {
     /// Java `isMismatchedDataVersion`: the client's handshake protocol differs from the game's own.
     fn client_on_other_protocol(&self, player: u128) -> bool {
         self.player(player)
-            .and_then(|p| self.host.player_protocol_version(p))
+            .and_then(|p| p.protocol_version(&*self.host))
             .is_some_and(|v| v != self.host.game_protocol_version())
     }
 
@@ -1176,7 +1176,7 @@ impl<'a> AxiomHost<'a> {
         let mut states = Box::new([UNMAPPED_STATE; 4096]);
         let mut only_air = true;
         // One call for the whole section, in the `(y << 8) | (z << 4) | x` order the core uses.
-        if let Some(blocks) = self.host.level_section_blocks(level.clone(), [cx, sy, cz]) {
+        if let Some(blocks) = level.clone().section_blocks(&*self.host, [cx, sy, cz]) {
             if blocks.len() == 4096 {
                 for (i, state) in blocks.into_iter().enumerate() {
                     let id = self.state_from_host(state);
