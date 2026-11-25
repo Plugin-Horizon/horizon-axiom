@@ -47,7 +47,8 @@ use crate::horizon_axiom_core::world::{
 };
 use crate::block_ids::{BlockTable, RegistryBlock};
 use mod_api::{
-    BlockMetadata, BlockState as HostState, BlockUpdateFlags, HostBlockStates, StateConstraint,
+    BlockMetadata, BlockState as HostState, BlockUpdateFlags, Direction, EntityChangeBlockPreEvent, HostBlockStates, MoveFail,
+    LoopContext, PlayerMoveCheckEvent, StateConstraint, VanillaGameEventEvent,
     ChunkRef, Command, CommandArgumentValue, Compound, Config, ConfigFile, ConfigKind,
     ConfigLoadingEvent, ConfigReloadingEvent, EntityRef, Flow, GameMode, GameRuleValue, Hooks,
     HostSide, LevelRef, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode,
@@ -61,7 +62,7 @@ use mod_api::{
 };
 use mod_api::text::{TextClick, TextHover, TextStyle};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -89,6 +90,84 @@ const CHUNK_TICKET_OWNER: TicketOwner = TicketOwner::Block([0, 0, 0]);
 static CHUNK_CONTROLLER: OnceLock<TicketController> = OnceLock::new();
 /// Set once the tickets an earlier run left in the saves have been released.
 static OLD_TICKETS_RELEASED: AtomicBool = AtomicBool::new(false);
+
+/// The game's own state texts by network id, read once (`block_state_network_id` for every state of every block);
+/// empty before the first host with a block registry.
+static EXACT_STATES: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Reads every state's exact id once, compares it with the derived numbering of `BlockTable` and logs the result.
+/// The exact texts then answer id-to-state lookups; the derived table still shapes the rest (global bits, block kinds).
+fn verify_block_ids(host: &dyn ServerHost) {
+    if EXACT_STATES.get().is_some() {
+        return;
+    }
+    let meta = host.block_states();
+    let mut pairs: Vec<(u32, String)> = Vec::new();
+    for key in host.block_keys() {
+        let Some(range) = meta.states_of(key) else { continue };
+        for state in range.iter() {
+            if let (Some(id), Some(text)) = (host.block_state_network_id(state), host.block_state_string(state)) {
+                pairs.push((id, text));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return;
+    }
+    let check = BlockTable::get().check(pairs.iter().cloned());
+    match check.first_wrong {
+        None => eprintln!("[axiom] block state ids: {} states, the derived numbering matches the game's", check.states),
+        Some((id, text)) => eprintln!(
+            "[axiom] block state ids: {} of {} states are numbered differently from the game's (first: {id} {text}); the game's ids are used",
+            check.wrong, check.states
+        ),
+    }
+    let top = pairs.iter().map(|(id, _)| *id).max().unwrap_or(0) as usize;
+    let mut texts = vec![String::new(); top + 1];
+    for (id, text) in pairs {
+        texts[id as usize] = text;
+    }
+    let _ = EXACT_STATES.set(texts);
+}
+
+/// `Direction.getClockWise` applied `quarter` times: a horizontal facing turns, up and down stay.
+fn turn_clockwise(direction: Direction, quarter: i32) -> Direction {
+    const RING: [Direction; 4] = [Direction::North, Direction::East, Direction::South, Direction::West];
+    match RING.iter().position(|d| *d == direction) {
+        Some(i) => RING[(i + quarter.rem_euclid(4) as usize) % 4],
+        None => direction,
+    }
+}
+
+/// What the hooks without a host (`player_move_check`, the physical-trigger hooks) need, refreshed every tick: they
+/// run inside the game's own move and landing code, where no host is handed over.
+#[derive(Default)]
+struct HookSets {
+    /// Active players holding `axiom.player.bypass_movement_restrictions`.
+    move_bypass: HashSet<u128>,
+    /// Of those, the ones flying now (noclip).
+    flying: HashSet<u128>,
+    /// Players who switched their physical triggers off (`axiom:set_no_physical_trigger`).
+    no_physical: HashSet<u128>,
+    /// The same players by entity id, for the hooks that name the entity.
+    no_physical_entities: HashSet<u32>,
+}
+
+static HOOK_SETS: Mutex<Option<HookSets>> = Mutex::new(None);
+
+fn hook_sets<T>(f: impl FnOnce(&HookSets) -> T) -> T {
+    let guard = HOOK_SETS.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(sets) => f(sets),
+        None => f(&HookSets::default()),
+    }
+}
+
+/// Java `onFailMove`: a player holding the bypass node may move too quickly (the arcball camera) or, flying, through
+/// blocks (noclip). The unloaded-chunk case is the game's own check and never reaches this hook.
+fn move_check_allows(sets: &HookSets, player: u128, reason: MoveFail) -> bool {
+    sets.move_bypass.contains(&player) && (reason == MoveFail::TooQuickly || sets.flying.contains(&player))
+}
 
 /// The state id (air) a block the vanilla table does not know, such as a mod's block, reads as.
 const UNMAPPED_STATE: u32 = 0;
@@ -575,6 +654,26 @@ fn run_ticks(host: &mut dyn ServerHost, state: &mut AxiomState) {
     state.custom_displays.tick(&mut h);
     state.hidden.tick(&mut h);
     sync_active(&mut h, state);
+    refresh_hook_sets(&h, state);
+}
+
+/// Rebuilds the sets the host-less hooks read.
+fn refresh_hook_sets(h: &AxiomHost<'_>, state: &AxiomState) {
+    let mut sets = HookSets::default();
+    for &uuid in &h.active {
+        let Some(player) = h.player(uuid) else { continue };
+        if permission_fallback(&*h.host, uuid, "axiom.player.bypass_movement_restrictions") {
+            sets.move_bypass.insert(uuid);
+            if player.abilities(&*h.host).is_some_and(|a| a.flying) {
+                sets.flying.insert(uuid);
+            }
+        }
+        if state.world.is_no_physical_trigger(uuid) {
+            sets.no_physical.insert(uuid);
+            sets.no_physical_entities.insert(player.entity().id());
+        }
+    }
+    *HOOK_SETS.lock().unwrap_or_else(|e| e.into_inner()) = Some(sets);
 }
 
 /// Copies the restrictions' active set into the host and the state, after anything that may have changed it.
@@ -877,7 +976,10 @@ impl<'a> AxiomHost<'a> {
         // first), each with its properties and legal values.
         BlockTable::ensure(|| {
             let meta = host.block_states();
-            host.block_keys()
+            // Ordered by the game's own ids (`block_state_network_id`): a block comes where its lowest state id is, so the
+            // numbering does not depend on the order the host lists its blocks in.
+            let mut blocks: Vec<(u32, RegistryBlock)> = host
+                .block_keys()
                 .into_iter()
                 .filter_map(|key| {
                     let id = meta.name(key).ok()?.to_owned();
@@ -887,10 +989,17 @@ impl<'a> AxiomHost<'a> {
                         .into_iter()
                         .map(|p| (p.name, p.values))
                         .collect();
-                    Some(RegistryBlock { id, properties })
+                    let lowest = meta
+                        .states_of(key)
+                        .and_then(|range| range.iter().filter_map(|state| host.block_state_network_id(state)).min())
+                        .unwrap_or(u32::MAX);
+                    Some((lowest, RegistryBlock { id, properties }))
                 })
-                .collect()
+                .collect();
+            blocks.sort_by_key(|(lowest, _)| *lowest);
+            blocks.into_iter().map(|(_, block)| block).collect()
         });
+        verify_block_ids(host);
         let known: BTreeSet<String> = host
             .entity_type_keys()
             .into_iter()
@@ -1066,8 +1175,10 @@ impl<'a> AxiomHost<'a> {
         if let Some(hit) = STATE_CACHE.with(|c| c.borrow().to_host.get(&id).copied()) {
             return hit;
         }
-        let resolved = BlockTable::get()
-            .state_string(id)
+        let exact = EXACT_STATES.get().and_then(|texts| texts.get(id as usize)).filter(|t| !t.is_empty());
+        let resolved = exact
+            .cloned()
+            .or_else(|| BlockTable::get().state_string(id))
             .and_then(|text| self.host.block_state_id(&text));
         STATE_CACHE.with(|c| c.borrow_mut().to_host.insert(id, resolved));
         resolved
@@ -1077,6 +1188,11 @@ impl<'a> AxiomHost<'a> {
     fn state_from_host(&self, state: HostState) -> StateId {
         if let Some(hit) = STATE_CACHE.with(|c| c.borrow().from_host.get(&state).copied()) {
             return hit;
+        }
+        // The game's own id for the state; a block the vanilla table does not hold (a mod's) has none the client knows.
+        if let Some(id) = self.host.block_state_network_id(state).filter(|id| *id < BlockTable::get().total()) {
+            STATE_CACHE.with(|c| c.borrow_mut().from_host.insert(state, id));
+            return id;
         }
         let meta = self.host.block_states();
         let id = meta
@@ -1130,6 +1246,11 @@ impl<'a> AxiomHost<'a> {
 
     fn entity_of(&self, uuid: u128) -> Option<EntityRef> {
         self.entities.get(&uuid).map(|(_, e)| e.clone())
+    }
+
+    /// The uuid of an indexed entity (`entity_uuid` needs a mutable host, so the dimension index is searched).
+    fn uuid_of(&self, entity: EntityRef) -> Option<u128> {
+        self.entities.iter().find(|(_, (_, e))| *e == entity).map(|(uuid, _)| *uuid)
     }
 
     /// The detached spawn tree that holds `uuid` (its root or a passenger), if the core is building one.
@@ -1503,19 +1624,9 @@ impl WorldHost for AxiomHost<'_> {
             .collect()
     }
     fn anti_xray_enabled(&self, player: u128) -> bool {
-        // next-engine (branch rec-player-misc): `player_anti_xray_active`.
-        #[cfg(feature = "next-engine")]
-        {
-            return self
-                .player(player)
-                .and_then(|p| p.anti_xray_active(&*self.host))
-                .unwrap_or(false);
-        }
-        #[cfg(not(feature = "next-engine"))]
-        {
-            let _ = player;
-            false
-        }
+        self.player(player)
+            .and_then(|p| p.anti_xray_active(&*self.host))
+            .unwrap_or(false)
     }
     fn send_payload(&mut self, player: u128, channel: &str, data: Vec<u8>) {
         self.send_raw(player, channel, &data);
@@ -1537,13 +1648,38 @@ impl AxiomHost<'_> {
         world_filters_pass(&self.config, dim) && self.dimension_of(player).as_deref() == Some(dim)
     }
 
-    /// The vanilla "may build" flag, which is all the region checks have on arismoko.
-    /// TODO(arismoko-api: region_may_build): WorldGuard-style regions and plot checks are not seen; a player who may
-    /// build anywhere is allowed here.
+    /// The vanilla "may build" flag (the player's abilities).
     fn may_build(&self, player: u128) -> bool {
         self.player(player)
             .and_then(|p| p.may_build(&*self.host))
             .unwrap_or(false)
+    }
+
+    /// Whether `player` may `action` (`break` or `place`) the block at `pos` in `dim`: the player's own flag, then what
+    /// the protection mods answer to `player_can_build_at` (land claims, regions, plots). No mod listening is no objection.
+    fn build_allowed(&mut self, player: u128, dim: &str, pos: [i32; 3], action: &str) -> bool {
+        self.may_build(player) && self.host.commands().player_can_build_at(player, dim, pos, action).unwrap_or(true)
+    }
+
+    /// `Integration.checkSection`: the section is asked in its eight octants, each at its centre block; the octants the
+    /// protection mods allow are the allowed boxes.
+    fn build_section(&mut self, player: u128, dim: &str, cx: i32, cy: i32, cz: i32) -> SectionPermissionChecker {
+        use crate::horizon_axiom_core::setblock::permission::LocalBox;
+        if !self.may_build(player) {
+            return SectionPermissionChecker::from_allowed_boxes(Vec::new());
+        }
+        let mut allowed = Vec::new();
+        for (ox, oy, oz) in [(0, 0, 0), (8, 0, 0), (0, 8, 0), (8, 8, 0), (0, 0, 8), (8, 0, 8), (0, 8, 8), (8, 8, 8)] {
+            let centre = [cx * 16 + ox + 4, cy * 16 + oy + 4, cz * 16 + oz + 4];
+            if self.host.commands().player_can_build_at(player, dim, centre, "place").unwrap_or(true) {
+                allowed.push(LocalBox::new(ox, oy, oz, ox + 7, oy + 7, oz + 7));
+            }
+        }
+        if allowed.len() == 8 {
+            SectionPermissionChecker::All
+        } else {
+            SectionPermissionChecker::from_allowed_boxes(allowed)
+        }
     }
 }
 
@@ -1672,8 +1808,13 @@ impl SetBlockHost for AxiomHost<'_> {
         self.state_at(dim, [pos.0, pos.1, pos.2])
             .is_some_and(|state| BlockTable::get().is_game_master_block(state))
     }
-    fn update_from_neighbour_shapes(&self, _dim: &str, _pos: BlockPos, state: u32) -> u32 {
-        state
+    fn update_from_neighbour_shapes(&mut self, dim: &str, pos: BlockPos, state: u32) -> u32 {
+        // `Block.updateFromNeighbourShapes` of the block at `pos`, nothing written (the core writes the result).
+        let Some(level) = self.level(dim) else { return state };
+        match level.update_from_neighbour_shapes(&mut *self.host, [pos.0, pos.1, pos.2]) {
+            Some(updated) => self.state_from_host(updated),
+            None => state,
+        }
     }
     fn is_block_loaded(&self, dim: &str, pos: BlockPos) -> bool {
         self.state_at(dim, [pos.0, pos.1, pos.2]).is_some()
@@ -1782,25 +1923,14 @@ impl SetBlockHost for AxiomHost<'_> {
         WorldHost::players_tracking_chunk(self, dim, cx, cz)
     }
     fn send_chunk_biomes(&mut self, _player: u128, _dim: &str, _chunks: &[(i32, i32)]) {}
-    fn region_can_break(&self, player: u128, _dim: &str, _pos: BlockPos) -> bool {
-        self.may_build(player)
+    fn region_can_break(&mut self, player: u128, dim: &str, pos: BlockPos) -> bool {
+        self.build_allowed(player, dim, [pos.0, pos.1, pos.2], "break")
     }
-    fn region_can_place(&self, player: u128, _dim: &str, _pos: BlockPos) -> bool {
-        self.may_build(player)
+    fn region_can_place(&mut self, player: u128, dim: &str, pos: BlockPos) -> bool {
+        self.build_allowed(player, dim, [pos.0, pos.1, pos.2], "place")
     }
-    fn region_section(
-        &self,
-        player: u128,
-        _dim: &str,
-        _cx: i32,
-        _cy: i32,
-        _cz: i32,
-    ) -> SectionPermissionChecker {
-        if self.may_build(player) {
-            SectionPermissionChecker::All
-        } else {
-            SectionPermissionChecker::from_allowed_boxes(Vec::new())
-        }
+    fn region_section(&mut self, player: u128, dim: &str, cx: i32, cy: i32, cz: i32) -> SectionPermissionChecker {
+        self.build_section(player, dim, cx, cy, cz)
     }
     fn ack_block_changes(&mut self, player: u128, sequence: i32) {
         if let Some(p) = self.player(player) {
@@ -1861,8 +1991,16 @@ impl SetBlockHost for AxiomHost<'_> {
             let _ = level.set_block(&mut *self.host, [pos.0, pos.1, pos.2], hs, update_flags(flags));
         }
     }
-    fn tick_fluid(&mut self, _dim: &str, _pos: BlockPos, _state: u32) {}
-    fn tick_block(&mut self, _dim: &str, _pos: BlockPos, _state: u32) {}
+    fn tick_fluid(&mut self, dim: &str, pos: BlockPos, _state: u32) {
+        if let Some(level) = self.level(dim) {
+            let _ = level.fluid_tick(&mut *self.host, [pos.0, pos.1, pos.2]);
+        }
+    }
+    fn tick_block(&mut self, dim: &str, pos: BlockPos, _state: u32) {
+        if let Some(level) = self.level(dim) {
+            let _ = level.block_tick(&mut *self.host, [pos.0, pos.1, pos.2]);
+        }
+    }
 }
 
 impl EntityHost for AxiomHost<'_> {
@@ -1902,11 +2040,11 @@ impl EntityHost for AxiomHost<'_> {
     fn send_payload(&mut self, player: u128, channel: &str, data: &[u8]) {
         self.send_raw(player, channel, data);
     }
-    fn can_place_block(&self, player: u128, _dim: &str, _x: i32, _y: i32, _z: i32) -> bool {
-        self.may_build(player)
+    fn can_place_block(&mut self, player: u128, dim: &str, x: i32, y: i32, z: i32) -> bool {
+        self.build_allowed(player, dim, [x, y, z], "place")
     }
-    fn can_break_block(&self, player: u128, _dim: &str, _x: i32, _y: i32, _z: i32) -> bool {
-        self.may_build(player)
+    fn can_break_block(&mut self, player: u128, dim: &str, x: i32, y: i32, z: i32) -> bool {
+        self.build_allowed(player, dim, [x, y, z], "break")
     }
     fn is_in_spawnable_bounds(&self, x: i32, y: i32, z: i32) -> bool {
         (-33_554_432..33_554_432).contains(&x)
@@ -1914,7 +2052,8 @@ impl EntityHost for AxiomHost<'_> {
             && (-33_554_432..33_554_432).contains(&z)
     }
     fn fire_spawn(&mut self, _player: u128, _uuid: u128) -> bool {
-        // TODO(arismoko-api: entity_spawn_event): no cancel hook; nothing vetoes an Axiom spawn.
+        // Another mod vetoes a spawn through `entity_join_level` (cancel), which the engine applies when the entity is
+        // added; no event of Axiom's own runs first, so nothing is asked here.
         false
     }
     fn fire_manipulate(&mut self, _player: u128, _uuid: u128) -> bool {
@@ -1962,21 +2101,21 @@ impl EntityHost for AxiomHost<'_> {
             .and_then(|e| e.is_passenger(&*self.host))
             .unwrap_or(false)
     }
-    fn vehicle(&self, _uuid: u128) -> Option<u128> {
-        // TODO(arismoko-api: entity_uuid_read): the vehicle's uuid needs `entity_uuid`, a mutable host call, and this
-        // read is `&self`; reads say no vehicle.
-        None
+    fn vehicle(&self, uuid: u128) -> Option<u128> {
+        let vehicle = self.entity_of(uuid)?.vehicle(&*self.host)?;
+        self.uuid_of(vehicle)
     }
-    fn passengers(&self, _uuid: u128) -> Vec<u128> {
-        // TODO(arismoko-api: entity_uuid_read): as `vehicle` (`entity_uuid` needs `&mut` host).
-        Vec::new()
+    fn passengers(&self, uuid: u128) -> Vec<u128> {
+        let passengers = self.entity_of(uuid).and_then(|e| e.passengers(&*self.host)).unwrap_or_default();
+        passengers.into_iter().filter_map(|p| self.uuid_of(p)).collect()
     }
     fn is_removed(&self, uuid: u128) -> bool {
         !self.entities.contains_key(&uuid)
     }
-    fn item_frame_on_y_axis(&self, _uuid: u128) -> bool {
-        // TODO(arismoko-api: entity_set_hanging_direction): hanging facing has no read yet.
-        false
+    fn item_frame_on_y_axis(&self, uuid: u128) -> bool {
+        self.entity_of(uuid)
+            .and_then(|e| e.hanging_direction(&*self.host))
+            .is_some_and(|d| matches!(d, Direction::Up | Direction::Down))
     }
     fn entity_as_passenger_nbt(&mut self, dim: &str, uuid: u128) -> Option<Nbt> {
         self.saved_entity(dim, uuid)
@@ -1998,11 +2137,27 @@ impl EntityHost for AxiomHost<'_> {
         );
         Some(node)
     }
-    fn set_hanging_turn(&mut self, _uuid: u128, _turn: Turn) {
-        // TODO(arismoko-api: entity_set_hanging_direction): hanging facing is not set.
+    fn set_hanging_turn(&mut self, uuid: u128, turn: Turn) {
+        // `HangingEntity.rotate`: a facing on the Y axis stays, a horizontal one turns clockwise by `turn`. An entity
+        // the core built but did not add (a pending tree) has no engine entity yet and is left as it is.
+        let Some(entity) = self.entity_of(uuid) else { return };
+        let Some(facing) = entity.hanging_direction(&*self.host) else { return };
+        let quarter = match turn {
+            Turn::None => 0,
+            Turn::Clockwise90 => 1,
+            Turn::Clockwise180 => 2,
+            Turn::CounterClockwise90 => 3,
+        };
+        let turned = turn_clockwise(facing, quarter);
+        if turned != facing {
+            let _ = entity.set_hanging_direction(&mut *self.host, turned);
+        }
     }
-    fn adjust_item_frame_rotation(&mut self, _uuid: u128, _delta: i32) {
-        // TODO(arismoko-api: item_frame_set_rotation): as `set_hanging_turn`.
+    fn adjust_item_frame_rotation(&mut self, uuid: u128, delta: i32) {
+        // `itemFrame.setRotation(itemFrame.getRotation() - delta)`, wrapped to eighths of a turn.
+        let Some(entity) = self.entity_of(uuid) else { return };
+        let Some(current) = entity.item_frame_rotation(&*self.host) else { return };
+        let _ = entity.set_item_frame_rotation(&mut *self.host, (i32::from(current) - delta).rem_euclid(8) as u8);
     }
     fn snap_to(&mut self, uuid: u128, pos: Pos, yaw: f32, pitch: f32) {
         if let Some(tree) = self.pending_tree_mut(uuid) {
@@ -2192,8 +2347,8 @@ impl RequestHost for AxiomHost<'_> {
     fn can_modify_world(&self, player: u128, dimension: &str) -> bool {
         self.modify_world_allowed(player, dimension)
     }
-    fn can_place_block(&self, player: u128, _dimension: &str, _x: i32, _y: i32, _z: i32) -> bool {
-        self.may_build(player)
+    fn can_place_block(&mut self, player: u128, dimension: &str, x: i32, y: i32, z: i32) -> bool {
+        self.build_allowed(player, dimension, [x, y, z], "place")
     }
     fn max_chunk_load_distance(&self, _dimension: &str) -> i32 {
         self.config.max_chunk_load_distance_for(false)
@@ -2322,9 +2477,8 @@ impl BlueprintHost for AxiomHost<'_> {
         let state = self.host.block_state_id(&text)?;
         Some(self.state_from_host(state))
     }
-    fn block_entity_type_of(&self, _state: u32) -> Option<String> {
-        // No API names the block entity type of a state (see GAPS_UPSTREAM.md).
-        None
+    fn block_entity_type_of(&self, state: u32) -> Option<String> {
+        self.host.block_state_block_entity_type(self.state_to_host(state)?)
     }
     fn block_entity_accepts(&self, _type_id: &str, state: u32) -> bool {
         SetBlockHost::has_block_entity(self, state)
@@ -2485,18 +2639,22 @@ impl DebugHost for AxiomHost<'_> {
             .map(|(_, text)| text.clone())
     }
     fn can_break_block(
-        &self,
+        &mut self,
         player: u128,
         _provider: Option<crate::horizon_axiom_core::custom::Provider>,
     ) -> bool {
-        self.may_build(player)
+        let dim = self.dimension_of(player).unwrap_or_default();
+        let (x, y, z) = SetBlockHost::player_block_pos(self, player);
+        self.build_allowed(player, &dim, [x, y, z], "break")
     }
     fn can_place_block(
-        &self,
+        &mut self,
         player: u128,
         _provider: Option<crate::horizon_axiom_core::custom::Provider>,
     ) -> bool {
-        self.may_build(player)
+        let dim = self.dimension_of(player).unwrap_or_default();
+        let (x, y, z) = SetBlockHost::player_block_pos(self, player);
+        self.build_allowed(player, &dim, [x, y, z], "place")
     }
     fn is_plot_world(&self, _player: u128) -> bool {
         false
@@ -2632,7 +2790,7 @@ fn debug(host: &mut dyn ServerHost, uuid: u128, args: &str) -> String {
     let (active, config, restrictions) = snapshot(uuid);
     let mut h = AxiomHost::new(host, active, config);
     h.debug_restrictions = restrictions.map(|text| (uuid, text));
-    custom::debug_command(&h, Some(uuid), args)
+    custom::debug_command(&mut h, Some(uuid), args)
         .unwrap_or_else(|| "This /axiompaperdebug subcommand is not known.".to_owned())
 }
 
@@ -2834,11 +2992,36 @@ impl Hooks for Mod {
         }
         tick(host);
     }
+
+    /// `PlayerFailMoveEvent`: the arcball camera moves too quickly and noclip moves through blocks.
+    fn player_move_check(&self, _: &dyn LoopContext, event: &mut PlayerMoveCheckEvent<'_>) -> Flow {
+        if hook_sets(|sets| move_check_allows(sets, event.player, event.reason)) {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// `NoPhysicalTriggerListener`, `PlayerInteractEvent` with `Action.PHYSICAL`: farmland and turtle eggs a no-trigger
+    /// player lands on stay as they are. (Pressure plates and tripwires: the hook names no entity, see ENGINE_NEEDS.)
+    fn entity_change_block_pre(&self, _: &mut dyn ServerHost, event: &mut EntityChangeBlockPreEvent<'_>) -> Flow {
+        match event.player {
+            Some(player) if hook_sets(|sets| sets.no_physical.contains(&player)) => Flow::Cancel,
+            _ => Flow::Continue,
+        }
+    }
+
+    /// `NoPhysicalTriggerListener`, `GenericGameEvent`: no game event of a no-trigger player (steps, vibrations).
+    fn vanilla_game_event(&self, _: &mut dyn ServerHost, event: &mut VanillaGameEventEvent<'_>) -> Flow {
+        match event.cause {
+            Some(entity) if hook_sets(|sets| sets.no_physical_entities.contains(&entity)) => Flow::Cancel,
+            _ => Flow::Continue,
+        }
+    }
 }
 
 /// A client's `axiom:*` payload, as the raw channel inbox hears it: queued for the tick, which routes it through
-/// `payload_in`. The physical-trigger cancel for no-physical-trigger players is still TODO(arismoko-api:
-/// player_physical_trigger).
+/// `payload_in`.
 fn on_custom_payload(player: u128, channel: &str, data: &[u8]) {
     queue(Event::Payload {
         player,
@@ -2979,5 +3162,35 @@ mod round2_tests {
             "# wool".to_owned(),
         ];
         assert_eq!(tag_entries(&list), vec!["minecraft:stairs", "minecraft:wool"]);
+    }
+}
+
+#[cfg(test)]
+mod round3_tests {
+    use super::*;
+
+    #[test]
+    fn a_horizontal_facing_turns_clockwise_and_up_down_stay() {
+        assert_eq!(turn_clockwise(Direction::North, 1), Direction::East);
+        assert_eq!(turn_clockwise(Direction::West, 1), Direction::North);
+        assert_eq!(turn_clockwise(Direction::South, 3), Direction::East);
+        assert_eq!(turn_clockwise(Direction::East, 2), Direction::West);
+        assert_eq!(turn_clockwise(Direction::Up, 1), Direction::Up);
+        assert_eq!(turn_clockwise(Direction::Down, 3), Direction::Down);
+    }
+
+    #[test]
+    fn the_move_bypass_follows_java_on_fail_move() {
+        let mut sets = HookSets::default();
+        sets.move_bypass.insert(7);
+        sets.flying.insert(7);
+        sets.move_bypass.insert(8);
+        // Too quickly: the bypass alone (arcball camera). Wrongly or clipped: only while flying (noclip).
+        assert!(move_check_allows(&sets, 7, MoveFail::TooQuickly));
+        assert!(move_check_allows(&sets, 7, MoveFail::ClippedIntoBlock));
+        assert!(move_check_allows(&sets, 8, MoveFail::TooQuickly));
+        assert!(!move_check_allows(&sets, 8, MoveFail::Wrongly));
+        // No bypass node: never.
+        assert!(!move_check_allows(&sets, 9, MoveFail::TooQuickly));
     }
 }

@@ -107,7 +107,7 @@ pub trait SetBlockHost {
     /// Java `blockEntity instanceof GameMasterBlock` for the block entity at `pos` (false if none).
     fn is_game_master_block(&self, dim: &str, pos: BlockPos) -> bool;
     /// Java `Block.updateFromNeighbourShapes(state, level, pos)`.
-    fn update_from_neighbour_shapes(&self, dim: &str, pos: BlockPos, state: u32) -> u32;
+    fn update_from_neighbour_shapes(&mut self, dim: &str, pos: BlockPos, state: u32) -> u32;
 
     // ---- chunks, sections and raw writes ----
 
@@ -174,9 +174,9 @@ pub trait SetBlockHost {
     // The glue combines every registered integration. `section` results are merged with
     // `SectionPermissionChecker::combine`. The bypass permission is checked by this module.
 
-    fn region_can_break(&self, player: u128, dim: &str, pos: BlockPos) -> bool;
-    fn region_can_place(&self, player: u128, dim: &str, pos: BlockPos) -> bool;
-    fn region_section(&self, player: u128, dim: &str, cx: i32, cy: i32, cz: i32) -> SectionPermissionChecker;
+    fn region_can_break(&mut self, player: u128, dim: &str, pos: BlockPos) -> bool;
+    fn region_can_place(&mut self, player: u128, dim: &str, pos: BlockPos) -> bool;
+    fn region_section(&mut self, player: u128, dim: &str, cx: i32, cy: i32, cz: i32) -> SectionPermissionChecker;
 
     // ---- placement packet side effects ----
 

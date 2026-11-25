@@ -172,7 +172,7 @@ fn apply_biome_buffer(
         if !host.is_chunk_loaded(&dim, cx, cz) {
             return;
         }
-        if !integration::can_place_block(&*host, player, &dim, ((qx << 2) + 1, (qy << 2) + 1, (qz << 2) + 1)) {
+        if !integration::can_place_block(&mut *host, player, &dim, ((qx << 2) + 1, (qy << 2) + 1, (qz << 2) + 1)) {
             return;
         }
         host.set_biome_quart(&dim, qx, qy, qz, key);
@@ -278,7 +278,7 @@ impl SetBlockBufferOperation {
             if scy < min_section || scy > max_section {
                 continue;
             }
-            let checker = integration::check_section(&*host, self.executor, dim, scx, scy, scz);
+            let checker = integration::check_section(&mut *host, self.executor, dim, scx, scy, scz);
             if checker.none_allowed() {
                 continue;
             }

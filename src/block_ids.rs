@@ -43,6 +43,25 @@ impl Block {
     }
 }
 
+/// How far the derived numbering is from the game's: see [`BlockTable::check`].
+#[derive(Default, Debug)]
+pub struct Check {
+    pub states: usize,
+    pub wrong: usize,
+    pub first_wrong: Option<(u32, String)>,
+}
+
+/// `minecraft:oak_stairs[facing=east,half=top]` as its name and property pairs.
+pub fn split_state(text: &str) -> (String, Vec<(String, String)>) {
+    let Some((name, rest)) = text.split_once('[') else { return (text.to_owned(), Vec::new()) };
+    let props = rest
+        .trim_end_matches(']')
+        .split(',')
+        .filter_map(|p| p.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
+        .collect();
+    (name.to_owned(), props)
+}
+
 /// The vanilla block state numbering.
 pub struct BlockTable {
     blocks: Vec<Block>,
@@ -160,6 +179,22 @@ impl BlockTable {
             out.push(']');
         }
         Some(out)
+    }
+
+    /// Compares the derived numbering with the game's exact ids: `exact` yields every state's network id with its text
+    /// (`minecraft:oak_stairs[facing=east,...]`). Counts the states the derived `id_of` numbers differently.
+    pub fn check(&self, exact: impl Iterator<Item = (u32, String)>) -> Check {
+        let mut out = Check::default();
+        for (id, text) in exact {
+            out.states += 1;
+            let (name, props) = split_state(&text);
+            let refs: Vec<(&str, &str)> = props.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            if self.id_of(&name, &refs) != Some(id) {
+                out.wrong += 1;
+                out.first_wrong.get_or_insert((id, text));
+            }
+        }
+        out
     }
 
     /// The three air blocks, which `is_air` and the buffers' empty state use.
@@ -326,5 +361,29 @@ mod tests {
         BlockTable::ensure(|| vec![block("minecraft:air", &[])]);
         BlockTable::ensure(|| panic!("asked again"));
         assert_eq!(BlockTable::get().total(), 1);
+    }
+
+    #[test]
+    fn the_check_counts_states_the_derived_ids_get_wrong() {
+        let table = table();
+        // stone is 1 and void_air 2 in the synthetic registry; water level=1 is 4; a state with swapped numbering is wrong.
+        let exact = vec![
+            (1u32, "minecraft:stone".to_owned()),
+            (2, "minecraft:void_air".to_owned()),
+            (4, "minecraft:water[level=1]".to_owned()),
+            (5, "minecraft:water[level=1]".to_owned()),
+        ];
+        let check = table.check(exact.into_iter());
+        assert_eq!((check.states, check.wrong), (4, 1));
+        assert_eq!(check.first_wrong, Some((5, "minecraft:water[level=1]".to_owned())));
+    }
+
+    #[test]
+    fn split_state_reads_name_and_properties() {
+        assert_eq!(split_state("minecraft:stone"), ("minecraft:stone".to_owned(), vec![]));
+        assert_eq!(
+            split_state("minecraft:oak_stairs[facing=east,half=top]"),
+            ("minecraft:oak_stairs".to_owned(), vec![("facing".to_owned(), "east".to_owned()), ("half".to_owned(), "top".to_owned())])
+        );
     }
 }

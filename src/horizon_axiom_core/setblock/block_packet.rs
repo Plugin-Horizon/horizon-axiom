@@ -253,7 +253,7 @@ fn fire_bukkit_events(host: &mut dyn SetBlockHost, player: u128, pkt: &SetBlockP
 }
 
 /// Java `canBreakOrPlace`: the chunk must be loaded, then the protection check for air (break) or a block (place).
-pub(super) fn can_break_or_place(host: &dyn SetBlockHost, player: u128, dim: &str, pos: BlockPos, state: u32) -> bool {
+pub(super) fn can_break_or_place(host: &mut dyn SetBlockHost, player: u128, dim: &str, pos: BlockPos, state: u32) -> bool {
     if !host.is_chunk_loaded(dim, pos.0 >> 4, pos.2 >> 4) {
         return false;
     }

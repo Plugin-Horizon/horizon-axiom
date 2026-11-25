@@ -75,7 +75,7 @@ pub trait RequestHost {
     /// Axiom may modify this world for this player (world regexes, `AxiomModifyWorldEvent` veto).
     fn can_modify_world(&self, player: u128, dimension: &str) -> bool;
     /// Protection check for one block (Integration.canPlaceBlock).
-    fn can_place_block(&self, player: u128, dimension: &str, x: i32, y: i32, z: i32) -> bool;
+    fn can_place_block(&mut self, player: u128, dimension: &str, x: i32, y: i32, z: i32) -> bool;
     /// Chunk distance (Manhattan, in chunks) within which chunks are loaded. Zero or less means
     /// "render-distance only". Plot worlds report 0.
     fn max_chunk_load_distance(&self, dimension: &str) -> i32;
@@ -605,7 +605,7 @@ mod tests {
         fn can_modify_world(&self, _: u128, _: &str) -> bool {
             true
         }
-        fn can_place_block(&self, player: u128, _: &str, _: i32, _: i32, _: i32) -> bool {
+        fn can_place_block(&mut self, player: u128, _: &str, _: i32, _: i32, _: i32) -> bool {
             !self.blocked.contains(&player)
         }
         fn max_chunk_load_distance(&self, _: &str) -> i32 {

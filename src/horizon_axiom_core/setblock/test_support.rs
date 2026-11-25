@@ -160,7 +160,7 @@ impl SetBlockHost for FakeHost {
     fn is_game_master_block(&self, _dim: &str, _pos: BlockPos) -> bool {
         false
     }
-    fn update_from_neighbour_shapes(&self, _dim: &str, _pos: BlockPos, state: u32) -> u32 {
+    fn update_from_neighbour_shapes(&mut self, _dim: &str, _pos: BlockPos, state: u32) -> u32 {
         state ^ 1
     }
     fn is_block_loaded(&self, dim: &str, pos: BlockPos) -> bool {
@@ -217,13 +217,13 @@ impl SetBlockHost for FakeHost {
         Vec::new()
     }
     fn send_chunk_biomes(&mut self, _player: u128, _dim: &str, _chunks: &[(i32, i32)]) {}
-    fn region_can_break(&self, _player: u128, _dim: &str, _pos: BlockPos) -> bool {
+    fn region_can_break(&mut self, _player: u128, _dim: &str, _pos: BlockPos) -> bool {
         self.region_ok
     }
-    fn region_can_place(&self, _player: u128, _dim: &str, _pos: BlockPos) -> bool {
+    fn region_can_place(&mut self, _player: u128, _dim: &str, _pos: BlockPos) -> bool {
         self.region_ok
     }
-    fn region_section(&self, _player: u128, _dim: &str, _cx: i32, _cy: i32, _cz: i32) -> SectionPermissionChecker {
+    fn region_section(&mut self, _player: u128, _dim: &str, _cx: i32, _cy: i32, _cz: i32) -> SectionPermissionChecker {
         self.region.clone()
     }
     fn ack_block_changes(&mut self, _player: u128, seq: i32) {

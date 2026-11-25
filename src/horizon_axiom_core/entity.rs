@@ -347,9 +347,9 @@ pub trait EntityHost {
 
     // ----- world and integrations -----
     /// `canPlaceBlock(player, location)` (Integration hook).
-    fn can_place_block(&self, player: u128, dim: &str, x: i32, y: i32, z: i32) -> bool;
+    fn can_place_block(&mut self, player: u128, dim: &str, x: i32, y: i32, z: i32) -> bool;
     /// `canBreakBlock(player, block)` (Integration hook).
-    fn can_break_block(&self, player: u128, dim: &str, x: i32, y: i32, z: i32) -> bool;
+    fn can_break_block(&mut self, player: u128, dim: &str, x: i32, y: i32, z: i32) -> bool;
     /// `Level.isInSpawnableBounds(BlockPos)`: horizontal and vertical world limits.
     fn is_in_spawnable_bounds(&self, x: i32, y: i32, z: i32) -> bool;
 
@@ -1454,10 +1454,10 @@ mod tests {
         fn send_payload(&mut self, player: u128, channel: &str, data: &[u8]) {
             self.sent.push((player, channel.into(), data.to_vec()));
         }
-        fn can_place_block(&self, _p: u128, _d: &str, x: i32, y: i32, z: i32) -> bool {
+        fn can_place_block(&mut self, _p: u128, _d: &str, x: i32, y: i32, z: i32) -> bool {
             !self.blocked_positions.contains(&(x, y, z))
         }
-        fn can_break_block(&self, _p: u128, _d: &str, _x: i32, _y: i32, _z: i32) -> bool {
+        fn can_break_block(&mut self, _p: u128, _d: &str, _x: i32, _y: i32, _z: i32) -> bool {
             true
         }
         fn is_in_spawnable_bounds(&self, _x: i32, _y: i32, _z: i32) -> bool {

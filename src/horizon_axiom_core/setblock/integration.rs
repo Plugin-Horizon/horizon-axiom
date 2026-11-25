@@ -9,7 +9,7 @@ use super::permission::SectionPermissionChecker;
 pub const BYPASS_REGION_CHECKS: &str = "axiomadmin.bypass_region_checks";
 
 /// Java `Integration.canBreakBlock(player, block)`.
-pub fn can_break_block(host: &dyn SetBlockHost, player: u128, dim: &str, pos: BlockPos) -> bool {
+pub fn can_break_block(host: &mut dyn SetBlockHost, player: u128, dim: &str, pos: BlockPos) -> bool {
     if host.has_bukkit_permission(player, BYPASS_REGION_CHECKS) {
         return true;
     }
@@ -17,7 +17,7 @@ pub fn can_break_block(host: &dyn SetBlockHost, player: u128, dim: &str, pos: Bl
 }
 
 /// Java `Integration.canPlaceBlock(player, location)`.
-pub fn can_place_block(host: &dyn SetBlockHost, player: u128, dim: &str, pos: BlockPos) -> bool {
+pub fn can_place_block(host: &mut dyn SetBlockHost, player: u128, dim: &str, pos: BlockPos) -> bool {
     if host.has_bukkit_permission(player, BYPASS_REGION_CHECKS) {
         return true;
     }
@@ -25,7 +25,7 @@ pub fn can_place_block(host: &dyn SetBlockHost, player: u128, dim: &str, pos: Bl
 }
 
 /// Java `Integration.checkSection(player, world, cx, cy, cz)`.
-pub fn check_section(host: &dyn SetBlockHost, player: u128, dim: &str, cx: i32, cy: i32, cz: i32) -> SectionPermissionChecker {
+pub fn check_section(host: &mut dyn SetBlockHost, player: u128, dim: &str, cx: i32, cy: i32, cz: i32) -> SectionPermissionChecker {
     if host.has_bukkit_permission(player, BYPASS_REGION_CHECKS) {
         return SectionPermissionChecker::All;
     }

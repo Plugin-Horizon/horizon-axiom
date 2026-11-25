@@ -80,8 +80,8 @@ pub trait DebugHost {
     /// Debug text of the player's restrictions, None when they have none.
     fn restrictions(&self, player: u128) -> Option<String>;
     /// None runs the generic Integration check, Some runs only that provider.
-    fn can_break_block(&self, player: u128, provider: Option<Provider>) -> bool;
-    fn can_place_block(&self, player: u128, provider: Option<Provider>) -> bool;
+    fn can_break_block(&mut self, player: u128, provider: Option<Provider>) -> bool;
+    fn can_place_block(&mut self, player: u128, provider: Option<Provider>) -> bool;
     fn is_plot_world(&self, player: u128) -> bool;
     /// Debug text of the current editable plot, "null" when there is none (Java toString).
     fn current_editable_plot(&self, player: u128) -> String;
@@ -696,7 +696,7 @@ pub fn send_update_dispatch_sends(host: &mut dyn CustomHost, player: u128, add: 
 /// Runs one `/axiompaperdebug` subcommand and returns the chat line.
 /// `sender` is None for non-players. Returns None when nothing would be sent: no permission,
 /// unknown subcommand, or a missing argument.
-pub fn debug_command(host: &dyn DebugHost, sender: Option<u128>, input: &str) -> Option<String> {
+pub fn debug_command(host: &mut dyn DebugHost, sender: Option<u128>, input: &str) -> Option<String> {
     let player = sender?;
     let allowed = host.is_op(player)
         || host.has_permission(player, "axiom.all")
@@ -1071,10 +1071,10 @@ mod tests {
         fn restrictions(&self, _: u128) -> Option<String> {
             None
         }
-        fn can_break_block(&self, _: u128, provider: Option<Provider>) -> bool {
+        fn can_break_block(&mut self, _: u128, provider: Option<Provider>) -> bool {
             provider == Some(Provider::WorldGuard)
         }
-        fn can_place_block(&self, _: u128, _: Option<Provider>) -> bool {
+        fn can_place_block(&mut self, _: u128, _: Option<Provider>) -> bool {
             false
         }
         fn is_plot_world(&self, _: u128) -> bool {
@@ -1087,25 +1087,25 @@ mod tests {
 
     #[test]
     fn debug_command_text_and_permissions() {
-        let host = DebugMock { ops: vec![1], perms: vec![2] };
-        assert_eq!(debug_command(&host, None, "canUseAxiom"), None);
-        assert_eq!(debug_command(&host, Some(3), "canUseAxiom"), None);
-        assert_eq!(debug_command(&host, Some(1), "canUseAxiom").as_deref(), Some("canUseAxiom: true"));
-        assert_eq!(debug_command(&host, Some(2), "canModifyWorld").as_deref(), Some("canModifyWorld: true"));
+        let mut host = DebugMock { ops: vec![1], perms: vec![2] };
+        assert_eq!(debug_command(&mut host, None, "canUseAxiom"), None);
+        assert_eq!(debug_command(&mut host, Some(3), "canUseAxiom"), None);
+        assert_eq!(debug_command(&mut host, Some(1), "canUseAxiom").as_deref(), Some("canUseAxiom: true"));
+        assert_eq!(debug_command(&mut host, Some(2), "canModifyWorld").as_deref(), Some("canModifyWorld: true"));
         assert_eq!(
-            debug_command(&host, Some(1), "isClientListening foo bar").as_deref(),
+            debug_command(&mut host, Some(1), "isClientListening foo bar").as_deref(),
             Some("listening to foo bar: true")
         );
-        assert_eq!(debug_command(&host, Some(1), "isClientListening"), None);
-        assert_eq!(debug_command(&host, Some(1), "getRestrictions").as_deref(), Some("no restrictions"));
+        assert_eq!(debug_command(&mut host, Some(1), "isClientListening"), None);
+        assert_eq!(debug_command(&mut host, Some(1), "getRestrictions").as_deref(), Some("no restrictions"));
         assert_eq!(
-            debug_command(&host, Some(1), "canBreakBlockAtCurrentPosition worldguard").as_deref(),
+            debug_command(&mut host, Some(1), "canBreakBlockAtCurrentPosition worldguard").as_deref(),
             Some("canBreakBlock: true")
         );
-        assert_eq!(debug_command(&host, Some(1), "canBreakBlockAtCurrentPosition bogus"), None);
-        assert_eq!(debug_command(&host, Some(1), "nope"), None);
+        assert_eq!(debug_command(&mut host, Some(1), "canBreakBlockAtCurrentPosition bogus"), None);
+        assert_eq!(debug_command(&mut host, Some(1), "nope"), None);
         assert_eq!(
-            debug_command(&DebugMock::default(), Some(DEBUG_COMMAND_UUID), "isPlotWorld").as_deref(),
+            debug_command(&mut DebugMock::default(), Some(DEBUG_COMMAND_UUID), "isPlotWorld").as_deref(),
             Some("isPlotWorld: false")
         );
     }
