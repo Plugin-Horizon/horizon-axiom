@@ -1508,7 +1508,7 @@ impl WorldHost for AxiomHost<'_> {
         {
             return self
                 .player(player)
-                .and_then(|p| self.host.player_anti_xray_active(p))
+                .and_then(|p| p.anti_xray_active(&*self.host))
                 .unwrap_or(false);
         }
         #[cfg(not(feature = "next-engine"))]
