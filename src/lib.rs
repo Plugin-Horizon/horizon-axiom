@@ -379,8 +379,10 @@ fn tag_entries(entries: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Nodes that are asked besides the core's own `axiom.*` ones: `/axiompaperdebug` and the region bypass.
-const EXTRA_NODES: [&str; 2] = ["axiom.debug", "axiomadmin.bypass_region_checks"];
+/// Nodes that are asked besides the core's own `axiom.*` ones: `/axiompaperdebug`, the region bypass and
+/// `axiom.builder_tool.ruler` (a child of `axiom.builder_tool.*` in plugin.yml; the Java `AxiomPermission` enum has no
+/// constant for it, so the core never sends it to the client and only a permission plugin sees it).
+const EXTRA_NODES: [&str; 3] = ["axiom.debug", "axiomadmin.bypass_region_checks", "axiom.builder_tool.ruler"];
 
 /// How often (in ticks) the permission answers of the online players are asked again.
 const PERMISSION_REFRESH_TICKS: u32 = 20;
@@ -3112,6 +3114,7 @@ mod tests {
         assert!(nodes.contains(&"axiom.default".to_owned()));
         assert!(nodes.contains(&"axiom.all".to_owned()));
         assert!(nodes.contains(&"axiom.debug".to_owned()));
+        assert!(nodes.contains(&"axiom.builder_tool.ruler".to_owned()), "plugin.yml child of axiom.builder_tool.*");
         assert!(nodes.contains(&"axiomadmin.bypass_region_checks".to_owned()));
         assert!(nodes.contains(&"axiomlimits.vip".to_owned()));
         assert!(!nodes.contains(&"axiom.entity.*".to_owned()));
