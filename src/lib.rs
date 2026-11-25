@@ -2478,7 +2478,7 @@ impl BlueprintHost for AxiomHost<'_> {
         Some(self.state_from_host(state))
     }
     fn block_entity_type_of(&self, state: u32) -> Option<String> {
-        self.host.block_state_block_entity_type(self.state_to_host(state)?)
+        self.host.block_states().block_entity_type(self.state_to_host(state)?)
     }
     fn block_entity_accepts(&self, _type_id: &str, state: u32) -> bool {
         SetBlockHost::has_block_entity(self, state)
