@@ -629,6 +629,37 @@ fn detach(
     })
 }
 
+/// The four ints a UUID is saved as (`UUID:[I;..]`): the most significant 32 bits first.
+pub fn uuid_ints(uuid: u128) -> [i32; 4] {
+    [(uuid >> 96) as i32, (uuid >> 64) as i32, (uuid >> 32) as i32, uuid as i32]
+}
+
+/// The NBT a detached tree is summoned from: the root's data with `UUID`, `Pos` and `Rotation` set to the spawn pose,
+/// and every passenger nested under `Passengers` in tree order (each with its own `UUID`, so the entities can be found by
+/// the UUIDs the core assigned). `None` when `root` is not the root of `nodes`.
+pub fn spawn_nbt(nodes: &[DetachedEntity], root: u128, pos: Pos, yaw: f32, pitch: f32) -> Option<Nbt> {
+    fn build(nodes: &[DetachedEntity], at: &DetachedEntity, pos: Pos, yaw: f32, pitch: f32) -> Nbt {
+        let mut map = match &at.data {
+            Nbt::Compound(m) => m.clone(),
+            _ => BTreeMap::new(),
+        };
+        map.insert("UUID".to_owned(), Nbt::IntArray(uuid_ints(at.uuid).to_vec()));
+        map.insert("Pos".to_owned(), Nbt::List(vec![Nbt::Double(pos.0), Nbt::Double(pos.1), Nbt::Double(pos.2)]));
+        map.insert("Rotation".to_owned(), Nbt::List(vec![Nbt::Float(yaw), Nbt::Float(pitch)]));
+        let children: Vec<Nbt> = nodes
+            .iter()
+            .filter(|n| n.parent == Some(at.uuid))
+            .map(|n| build(nodes, n, pos, yaw, pitch))
+            .collect();
+        if !children.is_empty() {
+            map.insert("Passengers".to_owned(), Nbt::List(children));
+        }
+        Nbt::Compound(map)
+    }
+    let root = nodes.iter().find(|n| n.uuid == root && n.parent.is_none())?;
+    Some(build(nodes, root, pos, yaw, pitch))
+}
+
 pub fn handle_spawn<H: EntityHost>(
     host: &mut H,
     player: u128,
@@ -1122,6 +1153,52 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), 43, "duplicate allow-list key");
+    }
+
+    #[test]
+    fn spawn_nbt_nests_the_tree_with_uuids_and_pose() {
+        let root_uuid: u128 = 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff;
+        assert_eq!(uuid_ints(root_uuid), [0x0011_2233, 0x4455_6677, 0x8899_aabbu32 as i32, 0xccdd_eeffu32 as i32]);
+        let mut n = 0u128;
+        let tag = compound(&[
+            ("id", Nbt::String("minecraft:horse".into())),
+            ("Tame", Nbt::Byte(1)),
+            (
+                "Passengers",
+                Nbt::List(vec![
+                    compound(&[
+                        ("id", Nbt::String("minecraft:skeleton".into())),
+                        ("Passengers", Nbt::List(vec![compound(&[("id", Nbt::String("minecraft:bat".into()))])])),
+                    ]),
+                    compound(&[("id", Nbt::String("minecraft:zombie".into()))]),
+                ]),
+            ),
+        ]);
+        let (_, flat) = build_detached_tree(&tag, root_uuid, &mut || {
+            n += 1;
+            n
+        })
+        .unwrap();
+        let nbt = spawn_nbt(&flat, root_uuid, (1.5, 64.0, -2.5), 90.0, 10.0).unwrap();
+        let Nbt::Compound(root) = &nbt else { panic!("root is a compound") };
+        assert_eq!(root.get("id"), Some(&Nbt::String("minecraft:horse".into())));
+        assert_eq!(root.get("Tame"), Some(&Nbt::Byte(1)));
+        assert_eq!(root.get("UUID"), Some(&Nbt::IntArray(uuid_ints(root_uuid).to_vec())));
+        assert_eq!(root.get("Pos"), Some(&Nbt::List(vec![Nbt::Double(1.5), Nbt::Double(64.0), Nbt::Double(-2.5)])));
+        assert_eq!(root.get("Rotation"), Some(&Nbt::List(vec![Nbt::Float(90.0), Nbt::Float(10.0)])));
+        let Some(Nbt::List(kids)) = root.get("Passengers") else { panic!("passengers") };
+        assert_eq!(kids.len(), 2);
+        let Nbt::Compound(skeleton) = &kids[0] else { panic!() };
+        assert_eq!(skeleton.get("id"), Some(&Nbt::String("minecraft:skeleton".into())));
+        assert_eq!(skeleton.get("UUID"), Some(&Nbt::IntArray(uuid_ints(1).to_vec())));
+        let Some(Nbt::List(deep)) = skeleton.get("Passengers") else { panic!("nested passengers") };
+        let Nbt::Compound(bat) = &deep[0] else { panic!() };
+        assert_eq!(bat.get("UUID"), Some(&Nbt::IntArray(uuid_ints(2).to_vec())));
+        assert!(!bat.contains_key("Passengers"), "a leaf carries no empty list");
+        let Nbt::Compound(zombie) = &kids[1] else { panic!() };
+        assert_eq!(zombie.get("UUID"), Some(&Nbt::IntArray(uuid_ints(3).to_vec())));
+        // A uuid that is not the root of the list builds nothing.
+        assert_eq!(spawn_nbt(&flat, 1, (0.0, 0.0, 0.0), 0.0, 0.0), None);
     }
 
     #[test]

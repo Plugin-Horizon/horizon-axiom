@@ -2239,11 +2239,44 @@ impl EntityHost for AxiomHost<'_> {
             rider.stop_riding(&mut *self.host);
         }
     }
-    fn add_fresh_entity_with_passengers(&mut self, _dim: &str, uuid: u128) -> bool {
-        // TODO(port): `host.summon` takes NBT with `UUID:[I;..]` (the API exists); the spawn tree and its
-        // passenger wiring are not written yet, so the tree is refused. It is dropped and nothing is summoned.
-        self.pending.remove(&uuid);
-        false
+    fn add_fresh_entity_with_passengers(&mut self, dim: &str, uuid: u128) -> bool {
+        // `tryAddFreshEntityWithPassengers`: the detached tree is summoned from its NBT with the passengers nested and
+        // every entity's UUID set, so the core finds each one by the UUID it assigned. A mod that keeps the root out
+        // (`entity_join_level`) makes `summon` answer None, which is the "not added" answer.
+        let Some(tree) = self.pending.remove(&uuid) else {
+            return false;
+        };
+        if tree.dim != dim {
+            return false;
+        }
+        let Some(Nbt::Compound(root)) = entity::spawn_nbt(&tree.nodes, uuid, tree.pose.pos, tree.pose.yaw, tree.pose.pitch) else {
+            return false;
+        };
+        let Some(Nbt::String(kind)) = root.get("id").cloned() else {
+            return false;
+        };
+        let Tag::Compound(compound) = core_to_tag(&Nbt::Compound(root)) else {
+            return false;
+        };
+        let (x, y, z) = tree.pose.pos;
+        let Some(id) = self.host.summon(dim, &kind, [x, y, z], compound) else {
+            return false;
+        };
+        let Some(root_ref) = self.host.entity(id) else {
+            return false;
+        };
+        let mut stack = vec![root_ref];
+        while let Some(current) = stack.pop() {
+            if let Some(found) = current.uuid(&mut *self.host) {
+                self.entities.insert(found, (dim.to_owned(), current.clone()));
+            }
+            // `setYHeadRot` of the pose, for every entity of the tree.
+            current.set_head_yaw(&mut *self.host, tree.pose.head_yaw);
+            if let Some(riders) = current.passengers(&*self.host) {
+                stack.extend(riders);
+            }
+        }
+        self.entities.contains_key(&uuid)
     }
     fn remove(&mut self, uuid: u128) {
         if self.pending.remove(&uuid).is_none() {
