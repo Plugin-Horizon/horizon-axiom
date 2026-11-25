@@ -53,7 +53,7 @@ use mod_api::{
     HostSide, LevelRef, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode,
     PermissionValueType, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
     RegisterCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerAboutToStartEvent,
-    ServerHost, ServerTickEvent, ServerTickPhase, Tag, Text, TicketController, TicketOwner,
+    ServerHost, ServerTickEvent, ServerTickPhase, Tag, TriState, Text, TicketController, TicketOwner,
 };
 use mod_api::{
     IPayloadContext, IPayloadHandler, PayloadBytes, PayloadHandleError, PayloadId, Registrar,
@@ -289,8 +289,17 @@ fn paper_world_name(dim: &str) -> &str {
     }
 }
 
-/// The play protocol of the game this mod is built for (26.3); Axiom's handshake compares the client's.
-const GAME_PROTOCOL: i32 = 777;
+/// The `#namespace:tag` entries of `disallowed-blocks`, as tag names without the `#` (`minecraft:` filled in).
+fn tag_entries(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|e| e.trim().strip_prefix('#'))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| if t.contains(':') { t.to_owned() } else { format!("minecraft:{t}") })
+        .collect()
+}
+
 /// Nodes that are asked besides the core's own `axiom.*` ones: `/axiompaperdebug` and the region bypass.
 const EXTRA_NODES: [&str; 2] = ["axiom.debug", "axiomadmin.bypass_region_checks"];
 
@@ -301,6 +310,8 @@ thread_local! {
     /// The nodes each online player holds, as of the last `refresh_permissions`. The core's host traits only get
     /// `&self`, which cannot ask the permission service, so the answers are taken at the tick start.
     static PERMS: RefCell<HashMap<u128, BTreeSet<String>>> = RefCell::new(HashMap::new());
+    /// Nodes a permission handler denies explicitly (`TriState::False`), per player, as of the last refresh.
+    static DENIED: RefCell<HashMap<u128, BTreeSet<String>>> = RefCell::new(HashMap::new());
 }
 static PERMISSION_TICKS: AtomicU32 = AtomicU32::new(0);
 /// `(added, removed)` top-level keys of the config file against the shipped default, as read at startup.
@@ -357,15 +368,28 @@ fn refresh_permissions(host: &mut dyn ServerHost) -> Vec<u128> {
     let nodes = declared_nodes(&keys);
     let online = host.players().server_players();
     let mut fresh: HashMap<u128, BTreeSet<String>> = HashMap::new();
+    let mut denied: HashMap<u128, BTreeSet<String>> = HashMap::new();
     for player in online {
         let own: BTreeSet<String> = nodes
             .iter()
             .filter(|n| player.permission_bool(host, &typed_node(n)).unwrap_or(false))
             .cloned()
             .collect();
+        let no: BTreeSet<String> = nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    host.permission_query_tristate(&typed_node(n), player.uuid(), &[]),
+                    Ok(TriState::False)
+                )
+            })
+            .cloned()
+            .collect();
+        denied.insert(player.uuid(), no);
         let held = with_parents(&own);
         fresh.insert(player.uuid(), held);
     }
+    DENIED.with(|cell| *cell.borrow_mut() = denied);
     PERMS.with(|cell| {
         let mut old = cell.borrow_mut();
         let changed = fresh
@@ -424,6 +448,11 @@ fn permission_fallback(_host: &dyn ServerHost, uuid: u128, node: &str) -> bool {
             .get(&uuid)
             .is_some_and(|held| held.contains(node))
     })
+}
+
+/// Whether a permission handler denied `node` explicitly for `uuid` at the last refresh (Bukkit `FALSE`).
+fn permission_denied(uuid: u128, node: &str) -> bool {
+    DENIED.with(|cell| cell.borrow().get(&uuid).is_some_and(|n| n.contains(node)))
 }
 
 /// Java `Player.isOp` as far as arismoko says it: a permission level of 1 and up.
@@ -832,6 +861,8 @@ struct AxiomHost<'a> {
     filter: EntityTypeFilter,
     /// `disallowed-blocks` as parsed entries: a client's state matching one reads as void air (Java `DisallowedBlocks`).
     disallowed: Vec<Disallowed>,
+    /// `disallowed-blocks` tag entries (`#namespace:tag`, stored without the `#`), asked of the engine's block tags.
+    disallowed_tags: Vec<String>,
     /// Entities of the dimensions indexed for this call: client-visible uuid to (dimension, engine handle).
     entities: HashMap<u128, (String, EntityRef)>,
     /// The restrictions text of the player who runs `/axiompaperdebug`.
@@ -871,12 +902,14 @@ impl<'a> AxiomHost<'a> {
             &known,
         );
         let disallowed = parse_all(&config.disallowed_blocks);
+        let disallowed_tags = tag_entries(&config.disallowed_blocks);
         Self {
             host,
             active,
             config,
             filter,
             disallowed,
+            disallowed_tags,
             entities: HashMap::new(),
             debug_restrictions: None,
             pending: HashMap::new(),
@@ -1221,9 +1254,15 @@ impl RestrictionsHost for AxiomHost<'_> {
         permission_fallback(&*self.host, player, node)
     }
     fn permission_value(&self, player: u128, node: &str) -> Option<bool> {
-        // HMOD-GAP(permission-explicit-deny): a typed Boolean query answers only yes or no, so an explicit deny
-        // cannot be told from "not set". A held node is Some(true); every other node is undecided (None).
-        permission_fallback(&*self.host, player, node).then_some(true)
+        // Explicit deny comes from `permission_query_tristate` at the last refresh (`DENIED`); a held node is
+        // Some(true), every other node is undecided (None).
+        if permission_fallback(&*self.host, player, node) {
+            Some(true)
+        } else if permission_denied(player, node) {
+            Some(false)
+        } else {
+            None
+        }
     }
     fn is_online(&self, player: u128) -> bool {
         self.player(player).is_some()
@@ -1251,9 +1290,7 @@ impl RestrictionsHost for AxiomHost<'_> {
         random_u64() as i64
     }
     fn server_protocol_version(&self) -> i32 {
-        // TODO(arismoko-api: game_protocol_version): no host method yet; the mod is built for game 26.3
-        // (`[native] game` in horizon-mod.toml), whose protocol is 777.
-        GAME_PROTOCOL
+        self.host.game_protocol_version()
     }
     fn server_data_version(&self) -> i32 {
         self.host.server_data_version()
@@ -1263,8 +1300,9 @@ impl RestrictionsHost for AxiomHost<'_> {
         false
     }
     fn protocol_name(&self, protocol: i32) -> String {
-        // TODO(arismoko-api: game_version_names): numbers only.
-        protocol.to_string()
+        self.host
+            .protocol_name(protocol)
+            .map_or_else(|| protocol.to_string(), str::to_owned)
     }
     fn map_client_block_registry(&mut self, _player: u128, _protocol: i32) -> Result<(), String> {
         // TODO(arismoko-api: client_block_registry): no per-release block mapping, so older clients are refused.
@@ -1538,7 +1576,14 @@ impl SetBlockHost for AxiomHost<'_> {
         // The client's ids are the vanilla 26.3 numbering, which `BlockTable` rebuilds. An id the game has no block
         // for (a mod's) is refused. A state under `disallowed-blocks` reads as void air, as Java's client registry does.
         let id = u32::try_from(wire_id).ok()?;
-        self.state_to_host(id)?;
+        let host_state = self.state_to_host(id)?;
+        if self
+            .disallowed_tags
+            .iter()
+            .any(|tag| self.host.block_in_tag(host_state.block(), tag).unwrap_or(false))
+        {
+            return Some(self.empty_state());
+        }
         if !self.disallowed.is_empty() {
             let text = BlockTable::get().state_string(id)?;
             if is_disallowed(&self.disallowed, &text) {
@@ -2292,8 +2337,10 @@ impl BlueprintHost for AxiomHost<'_> {
         false
     }
     fn game_version_name(&self) -> String {
-        // TODO(arismoko-api: game_version_names): the server runs Minecraft 26.3.
-        "26.3".to_owned()
+        let protocol = self.host.game_protocol_version();
+        self.host
+            .protocol_name(protocol)
+            .map_or_else(|| "26.3".to_owned(), str::to_owned)
     }
     fn send_message(&mut self, player: u128, text: &str) {
         self.tell(player, text);
@@ -2876,5 +2923,20 @@ mod block_state_tests {
         // IMMEDIATE (8) has no counterpart.
         assert_eq!(update_flags(8).bits(), 0);
         assert_eq!(update_flags(RAW_WRITE_BITS).bits(), 2 | 16 | 32 | 256 | 512);
+    }
+}
+
+#[cfg(test)]
+mod round2_tests {
+    use super::tag_entries;
+
+    #[test]
+    fn tag_entries_take_hash_names_only() {
+        let list = vec![
+            "minecraft:wheat".to_owned(),
+            "#minecraft:stairs".to_owned(),
+            "# wool".to_owned(),
+        ];
+        assert_eq!(tag_entries(&list), vec!["minecraft:stairs", "minecraft:wool"]);
     }
 }

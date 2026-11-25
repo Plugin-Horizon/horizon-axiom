@@ -41,7 +41,7 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
-- `disallowed-blocks`: block-state entries match, tag entries (`#namespace:tag`) do not (no block tag table in the port).
+- `disallowed-blocks`: block-state entries and tag entries (`#namespace:tag`, via the engine's block tags) both match.
 - `/axiompaperdebug` tab-completes its subcommands, but the usages are listed to every player (Brigadier hides them from senders without the permission).
 - Block states use the vanilla numbering derived at runtime from the engine's own block registry (`block_keys` in registry order, each block's `definition`, properties sorted by name, first one slowest); no game data table ships with the mod. A mod's blocks are unmapped. Block entity data is read and written; there is no block state data fixer, no block entity type of a state, and older clients are refused (no per-release block mapping).
 - Sections are read cell by cell; `update_from_neighbour_shapes` and the tick-blocks packet do nothing (no API).
@@ -49,6 +49,7 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 - Markers are listed from the level's entities with their custom data (vanilla's own entity keys cut); a marker hidden by Axiom's gizmo flag is still sent, as the flag lives in the core state.
 - Region and plot checks (WorldGuard-style) are not seen.
 - The game protocol version and the mod data folder are approximated.
+- Round 2: game protocol and version names come from the host; explicit permission denies are read with `permission_query_tristate` and sent to the client.
 - Permissions are typed nodes. A node also holds when a typed ancestor holds, as plugin.yml's `children` do (`axiom.default` grants `axiom.build.place` through `axiom.build.*`); a wildcard ancestor cannot be asked itself, so only its typed ancestors count. The nodes are every `axiom.*` leaf, `axiom.default`, `axiom.all`, `axiom.debug`, `axiomadmin.bypass_region_checks`, `axiomlimits.<key>`), op-default at level 1 as in `plugin.yml`. A typed query cannot tell an explicit deny from "not set", so explicit denies of a node are not sent to the client, and the wildcard nodes (`axiom.entity.*`, the deprecated `axiom.*`) cannot be queried: a wildcard grant reaches the leaf through the permission handler, and the deprecated-wildcard notice is not sent. `axiomadmin.bypass_region_checks` and `axiomlimits.<key>` default to level 4 (Bukkit: nobody / unset).
 - Answers are taken every 20 ticks, so a changed grant takes up to a second to apply.
 

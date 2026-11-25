@@ -3,7 +3,7 @@
 // `disallowed-blocks` in config.yml: a block state a client may not use. Java maps every disallowed state to the
 // empty state (void_air) on the client's registry, so a client that sends one places air. An entry is a block state
 // string such as `minecraft:oak_stairs[waterlogged=true]`; a bare block name matches every state of that block.
-// Tag entries (`#namespace:tag`) are not matched: the port has no block tag table (see the Known gaps in README.md).
+// Tag entries (`#namespace:tag`) are matched by the glue in lib.rs through the engine's block tags.
 
 /// One parsed entry: a block name and the property values it requires (sorted as written, may be empty).
 #[derive(Clone, Debug, PartialEq, Eq)]
