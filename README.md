@@ -42,7 +42,7 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
 - `disallowed-blocks`: block-state entries and tag entries (`#namespace:tag`, via the engine's block tags) both match.
-- `/axiompaperdebug` tab-completes its subcommands, but the usages are listed to every player (Brigadier hides them from senders without the permission).
+- Round 2b: section reads, block-state data fixers, annotation folder (`dimensions/<ns>/<path>`), client protocol check and debug-usage hiding (node `axiom.debug`) are done. Anti-xray warning is behind `next-engine` (branch rec-player-misc); can-build and shape updates wait for rec-cancel-hooks / rec-world-data.
 - Block states use the vanilla numbering derived at runtime from the engine's own block registry (`block_keys` in registry order, each block's `definition`, properties sorted by name, first one slowest); no game data table ships with the mod. A mod's blocks are unmapped. Block entity data is read and written; there is no block state data fixer, no block entity type of a state, and older clients are refused (no per-release block mapping).
 - Sections are read cell by cell; `update_from_neighbour_shapes` and the tick-blocks packet do nothing (no API).
 - No cancel hook for Axiom's entity spawns; hanging-entity facing is not read or set.

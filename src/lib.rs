@@ -52,7 +52,7 @@ use mod_api::{
     ConfigLoadingEvent, ConfigReloadingEvent, EntityRef, Flow, GameMode, GameRuleValue, Hooks,
     HostSide, LevelRef, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode,
     PermissionValueType, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
-    RegisterCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerAboutToStartEvent,
+    RegisterCommandsEvent, RegisterConfigsEvent, RegisterNodeCommandsEvent, RunModCommandEvent, ServerAboutToStartEvent,
     ServerHost, ServerTickEvent, ServerTickPhase, Tag, TriState, Text, TicketController, TicketOwner,
 };
 use mod_api::{
@@ -920,6 +920,13 @@ impl<'a> AxiomHost<'a> {
         self.host.player(uuid)
     }
 
+    /// Java `isMismatchedDataVersion`: the client's handshake protocol differs from the game's own.
+    fn client_on_other_protocol(&self, player: u128) -> bool {
+        self.player(player)
+            .and_then(|p| self.host.player_protocol_version(p))
+            .is_some_and(|v| v != self.host.game_protocol_version())
+    }
+
     fn online_uuids(&self) -> Vec<u128> {
         self.host
             .players()
@@ -1168,6 +1175,17 @@ impl<'a> AxiomHost<'a> {
         let table = BlockTable::get();
         let mut states = Box::new([UNMAPPED_STATE; 4096]);
         let mut only_air = true;
+        // One call for the whole section, in the `(y << 8) | (z << 4) | x` order the core uses.
+        if let Some(blocks) = self.host.level_section_blocks(level.clone(), [cx, sy, cz]) {
+            if blocks.len() == 4096 {
+                for (i, state) in blocks.into_iter().enumerate() {
+                    let id = self.state_from_host(state);
+                    only_air &= table.is_air(id);
+                    states[i] = id;
+                }
+                return if only_air { SectionRead::Empty } else { SectionRead::Blocks(states) };
+            }
+        }
         for y in 0..16 {
             for z in 0..16 {
                 for x in 0..16 {
@@ -1484,8 +1502,20 @@ impl WorldHost for AxiomHost<'_> {
             })
             .collect()
     }
-    fn anti_xray_enabled(&self, _player: u128) -> bool {
-        false
+    fn anti_xray_enabled(&self, player: u128) -> bool {
+        // next-engine (branch rec-player-misc): `player_anti_xray_active`.
+        #[cfg(feature = "next-engine")]
+        {
+            return self
+                .player(player)
+                .and_then(|p| self.host.player_anti_xray_active(p))
+                .unwrap_or(false);
+        }
+        #[cfg(not(feature = "next-engine"))]
+        {
+            let _ = player;
+            false
+        }
     }
     fn send_payload(&mut self, player: u128, channel: &str, data: Vec<u8>) {
         self.send_raw(player, channel, &data);
@@ -2146,8 +2176,8 @@ impl RequestHost for AxiomHost<'_> {
     fn has_permission(&self, player: u128, node: &str) -> bool {
         permission_fallback(&*self.host, player, node)
     }
-    fn is_mismatched_data_version(&self, _player: u128) -> bool {
-        false
+    fn is_mismatched_data_version(&self, player: u128) -> bool {
+        self.client_on_other_protocol(player)
     }
     fn is_player_online(&self, player: u128) -> bool {
         self.player(player).is_some()
@@ -2301,10 +2331,13 @@ impl BlueprintHost for AxiomHost<'_> {
     }
     fn upgrade_block_state(&self, nbt: Nbt, from_version: i32) -> Result<Nbt, String> {
         if from_version == self.data_version() {
-            Ok(nbt)
-        } else {
-            Err("no block state data fixer available for an older data version".to_owned())
+            return Ok(nbt);
         }
+        let Tag::Compound(data) = core_to_tag(&nbt) else { return Err("not a compound".to_owned()) };
+        self.host
+            .upgrade_block_state_nbt(from_version, data)
+            .map(|c| tag_to_core(&Tag::Compound(c)))
+            .map_err(|e| format!("{e:?}"))
     }
     fn upgrade_block_entity(&self, nbt: Nbt, from_version: i32) -> Result<Nbt, String> {
         let Tag::Compound(data) = core_to_tag(&nbt) else { return Err("not a compound".to_owned()) };
@@ -2333,8 +2366,8 @@ impl BlueprintHost for AxiomHost<'_> {
     fn can_use_axiom(&self, player: u128, permission: &str) -> bool {
         self.active.contains(&player) && permission_fallback(&*self.host, player, permission)
     }
-    fn is_mismatched_data_version(&self, _player: u128) -> bool {
-        false
+    fn is_mismatched_data_version(&self, player: u128) -> bool {
+        self.client_on_other_protocol(player)
     }
     fn game_version_name(&self) -> String {
         let protocol = self.host.game_protocol_version();
@@ -2363,10 +2396,12 @@ impl AnnotationHost for AxiomHost<'_> {
     fn send_markers(&self) -> bool {
         self.config.send_markers
     }
-    fn world_folder(&self, _dim: &str) -> Option<PathBuf> {
-        // TODO(arismoko-api: world_dir): `host.world_dir()` gives the level root; the per-dimension folder mapping for
-        // annotations (Paper 26 `dimensions/...` layout) is not verified yet.
-        None
+    fn world_folder(&self, dim: &str) -> Option<PathBuf> {
+        // Level root plus the 26.x per-dimension layout (`dimensions/<namespace>/<path>`, as the engine's datafixer
+        // files code names `dimensions/minecraft/overworld`).
+        let root = self.host.world_dir()?;
+        let (ns, path) = dim.split_once(':').unwrap_or(("minecraft", dim));
+        Some(root.join("dimensions").join(ns).join(path))
     }
     fn player_dimension(&self, player: u128) -> Option<String> {
         self.dimension_of(player)
@@ -2431,8 +2466,8 @@ impl DebugHost for AxiomHost<'_> {
     fn can_use_axiom(&self, player: u128) -> bool {
         self.active.contains(&player)
     }
-    fn is_mismatched_data_version(&self, _player: u128) -> bool {
-        false
+    fn is_mismatched_data_version(&self, player: u128) -> bool {
+        self.client_on_other_protocol(player)
     }
     fn can_modify_world(&self, player: u128) -> bool {
         self.dimension_of(player)
@@ -2727,12 +2762,18 @@ impl Hooks for Mod {
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         // Registered for every player: the handler checks op / axiom.debug / the debug UUID itself (Java: the
         // axiom.debug permission, not op only, and Brigadier hides the usages from everyone else).
-        for usage in DEBUG_USAGES {
-            event.commands.push(Command::new(usage));
-        }
         event
             .commands
             .push(Command::op("axiompapermigrateconfig", 1));
+    }
+
+    /// Brigadier usage hiding: the debug usages ask `axiom.debug`, so a permission handler hides them from senders
+    /// without it (the built-in handler keeps the level).
+    fn register_node_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterNodeCommandsEvent<'_>) {
+        let node = typed_node("axiom.debug");
+        for usage in DEBUG_USAGES {
+            event.commands.push(Command::new(usage).with_node(&node));
+        }
     }
 
     fn run_mod_command(

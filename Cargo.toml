@@ -14,3 +14,8 @@ toml = "1.1"
 # Pure Rust zstd (decoder + fast encoder). Default features only pull twox-hash, which Horizon already locks.
 ruzstd = "0.9"
 
+
+[features]
+default = []
+# Code written against engine APIs that live in local branches (rec-player-misc: player_anti_xray_active).
+next-engine = []
