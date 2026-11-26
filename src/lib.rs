@@ -117,11 +117,11 @@ fn verify_block_ids(host: &dyn ServerHost) {
     }
     let check = BlockTable::get().check(pairs.iter().cloned());
     match check.first_wrong {
-        None => eprintln!("[axiom] block state ids: {} states, the derived numbering matches the game's", check.states),
-        Some((id, text)) => eprintln!(
-            "[axiom] block state ids: {} of {} states are numbered differently from the game's (first: {id} {text}); the game's ids are used",
+        None => log(&format!("block state ids: {} states, the derived numbering matches the game's", check.states)),
+        Some((id, text)) => log(&format!(
+            "block state ids: {} of {} states are numbered differently from the game's (first: {id} {text}); the game's ids are used",
             check.wrong, check.states
-        ),
+        )),
     }
     let top = pairs.iter().map(|(id, _)| *id).max().unwrap_or(0) as usize;
     let mut texts = vec![String::new(); top + 1];
@@ -339,8 +339,14 @@ fn queue(event: Event) {
     EVENTS.lock().unwrap_or_else(|e| e.into_inner()).push(event);
 }
 
+/// The game's log (`logs/latest.log`), not stderr: the console alone would hide every line from the server log.
 fn log(line: &str) {
-    eprintln!("[axiom] {line}");
+    log::info!("[axiom] {line}");
+}
+
+/// The channels of the handshake itself: each is sent or heard rarely (once per join), so each is logged.
+fn handshake_channel(channel: &str) -> bool {
+    matches!(channel, "axiom:hello" | "axiom:enable" | "axiom:goodbye")
 }
 
 /// The settings in force become `config`. A new config rebuilds the core state, so every client handshakes again.
@@ -724,6 +730,9 @@ fn payload_in(
     channel: &str,
     data: &[u8],
 ) {
+    if handshake_channel(channel) {
+        log(&format!("heard {channel} from {player:032x} ({} bytes)", data.len()));
+    }
     if channel == CHANNEL_TUNNEL {
         tunnel_buffer(host, state, player, data);
         return;
@@ -1109,8 +1118,12 @@ impl<'a> AxiomHost<'a> {
             return;
         };
         let id = PayloadId(channel.to_owned());
-        if let Err(e) = p.send_payload(&mut *self.host, &id, PayloadBytes(data.to_vec())) {
-            log(&format!("cannot send {channel} to {player:032x}: {e:?}"));
+        match p.send_payload(&mut *self.host, &id, PayloadBytes(data.to_vec())) {
+            Ok(_) if handshake_channel(channel) => {
+                log(&format!("sent {channel} to {player:032x} ({} bytes)", data.len()));
+            }
+            Ok(_) => {}
+            Err(e) => log(&format!("cannot send {channel} to {player:032x}: {e:?}")),
         }
     }
 
@@ -3192,6 +3205,15 @@ fn encode_marker(uuid: u128, position: [f64; 3], data: &Nbt) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_handshake_channels_are_the_logged_ones() {
+        for channel in ["axiom:hello", "axiom:enable", "axiom:goodbye"] {
+            assert!(handshake_channel(channel), "{channel}");
+        }
+        assert!(!handshake_channel("axiom:set_block"));
+        assert!(!handshake_channel("axiom:tunnel"));
+    }
 
     #[test]
     fn heightmap_files_are_recognised_by_their_leading_bytes() {

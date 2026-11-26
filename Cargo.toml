@@ -13,3 +13,5 @@ serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 # Pure Rust zstd (decoder + fast encoder). Default features only pull twox-hash, which Horizon already locks.
 ruzstd = "0.9"
+# The game's log (Horizon's logger takes the `log` facade).
+log = "0.4"
