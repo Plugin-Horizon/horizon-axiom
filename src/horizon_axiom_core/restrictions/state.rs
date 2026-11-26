@@ -132,6 +132,7 @@ impl RestrictionsState {
                 format!("Unable to use Axiom, server hasn't updated Axiom yet.{versions}")
             };
 
+            host.log_line(&format!("hello from {player:032x} rejected: {message}"));
             send_goodbye(host, player, &message);
 
             match self.config.unsupported_axiom_action() {
@@ -152,10 +153,12 @@ impl RestrictionsState {
         let handshake_id = r.read_i64()?;
 
         if !self.accept_handshake(player, handshake_id) {
+            host.log_line(&format!("hello from {player:032x} rejected: invalid handshake id"));
             send_goodbye(host, player, "Invalid handshake ID");
             return Ok(());
         }
         if !self.has_permission(host, player, AxiomPermission::Use) {
+            host.log_line(&format!("hello from {player:032x} rejected: missing axiom.use permission"));
             send_goodbye(host, player, "Missing axiom.use permission");
             return Ok(());
         }
@@ -164,12 +167,15 @@ impl RestrictionsState {
         if protocol_version != server_protocol {
             let action = self.config.incompatible_data_action();
 
-            if !host.plugin_enabled("ViaVersion") {
+            if !(host.plugin_enabled("ViaVersion") || host.accepts_older_client(protocol_version)) {
                 let message = format!(
                     "Axiom: Incompatible data version detected (client {}, server {})",
                     data_version,
                     host.server_data_version()
                 );
+                host.log_line(&format!(
+                    "hello from {player:032x} rejected: client protocol {protocol_version} differs from server {server_protocol} and the server translates no older clients ({message})"
+                ));
                 send_goodbye(host, player, &message);
 
                 match action {
@@ -192,6 +198,7 @@ impl RestrictionsState {
                             host.protocol_name(server_protocol)
                         );
                         let message = format!("Axiom+ViaVersion: {error} ({description})");
+                        host.log_line(&format!("hello from {player:032x} rejected: {message}"));
                         send_goodbye(host, player, &message);
 
                         // Java: only `warn` keeps the player connected; `kick` and `ignore` both disconnect.
@@ -659,6 +666,36 @@ mod tests {
         assert_eq!(host.sent_on(CHANNEL_ENABLE).len(), 1);
         assert_eq!(host.sent_on(CHANNEL_RESTRICTIONS).len(), 1);
         assert!(host.sent_on(CHANNEL_GOODBYE).is_empty());
+    }
+
+    #[test]
+    fn older_client_accepted_when_server_translates_older_clients() {
+        let mut st = state();
+        let mut host = host_with_use();
+        host.older_clients_from = Some(766);
+        for _ in 0..SLOW_TICK_INTERVAL {
+            st.tick(&mut host);
+        }
+        st.on_hello(&mut host, ALICE, &hello_body(API_VERSION, 4000, 774, 5))
+            .unwrap();
+        assert!(st.is_active(ALICE));
+        assert_eq!(host.sent_on(CHANNEL_ENABLE).len(), 1);
+        assert!(host.sent_on(CHANNEL_GOODBYE).is_empty());
+        assert!(host.kicks.is_empty());
+    }
+
+    #[test]
+    fn older_client_rejected_with_one_log_line_when_not_translated() {
+        let mut st = state();
+        let mut host = host_with_use();
+        for _ in 0..SLOW_TICK_INTERVAL {
+            st.tick(&mut host);
+        }
+        st.on_hello(&mut host, ALICE, &hello_body(API_VERSION, 4000, 774, 5))
+            .unwrap();
+        assert!(!st.is_active(ALICE));
+        assert_eq!(host.logs.len(), 1);
+        assert!(host.logs[0].contains("774"));
     }
 
     #[test]

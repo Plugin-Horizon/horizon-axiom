@@ -89,6 +89,11 @@ pub trait RestrictionsHost {
     fn server_data_version(&self) -> i32;
     /// Whether a plugin is enabled (`Bukkit.getPluginManager().isPluginEnabled`), e.g. "ViaVersion", "LuckPerms".
     fn plugin_enabled(&self, name: &str) -> bool;
+    /// Whether the server itself lets a client on `protocol` join and translates its packets
+    /// (Horizon's `horizon-accept-older-clients`); it plays the role ViaVersion has on Paper.
+    fn accepts_older_client(&self, protocol: i32) -> bool;
+    /// One log line, used to say why a hello was turned away.
+    fn log_line(&mut self, text: &str);
     /// Human name of a protocol number (`ProtocolVersion.getProtocol(n).toString()`).
     fn protocol_name(&self, protocol: i32) -> String;
     /// ViaVersion path: build the block-state mapping for a client on `protocol`, for `player`.
@@ -125,6 +130,8 @@ pub(crate) mod test_host {
         pub editable: Option<PlotBounds>,
         pub via_installed: bool,
         pub via_error: Option<String>,
+        pub older_clients_from: Option<i32>,
+        pub logs: Vec<String>,
         pub next_random: i64,
         pub server_protocol: i32,
         pub sent: Vec<(u128, String, Vec<u8>)>,
@@ -186,6 +193,13 @@ pub(crate) mod test_host {
         }
         fn plugin_enabled(&self, name: &str) -> bool {
             name == "ViaVersion" && self.via_installed
+        }
+        fn accepts_older_client(&self, protocol: i32) -> bool {
+            self.older_clients_from
+                .is_some_and(|lo| protocol >= lo && protocol < self.server_protocol)
+        }
+        fn log_line(&mut self, text: &str) {
+            self.logs.push(text.to_string());
         }
         fn protocol_name(&self, protocol: i32) -> String {
             format!("proto{protocol}")

@@ -340,6 +340,9 @@ fn queue(event: Event) {
 }
 
 /// The game's log (`logs/latest.log`), not stderr: the console alone would hide every line from the server log.
+/// Protocol of 1.20.5, the oldest release Horizon translates.
+const OLDEST_ACCEPTED_PROTOCOL: i32 = 766;
+
 fn log(line: &str) {
     log::info!("[axiom] {line}");
 }
@@ -1529,6 +1532,14 @@ impl RestrictionsHost for AxiomHost<'_> {
     fn plugin_enabled(&self, _name: &str) -> bool {
         // Horizon runs no Bukkit plugins, and ViaVersion is not part of arismoko (no client-version adapter here).
         false
+    }
+    fn accepts_older_client(&self, protocol: i32) -> bool {
+        // `horizon-accept-older-clients` has no mod API; the engine only lets a client of 1.20.5 (766) up to the
+        // release before this one join when it is on, so an older number in a hello means the server accepted it.
+        (OLDEST_ACCEPTED_PROTOCOL..self.host.game_protocol_version()).contains(&protocol)
+    }
+    fn log_line(&mut self, text: &str) {
+        log(text);
     }
     fn protocol_name(&self, protocol: i32) -> String {
         self.host
