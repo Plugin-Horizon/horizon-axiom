@@ -231,6 +231,12 @@ fn update_flags(bits: u32) -> BlockUpdateFlags {
         .fold(BlockUpdateFlags::NONE, |acc, (_, flag)| acc | *flag)
 }
 
+/// `AxiomModifyWorldEvent` has no listener here, so its final cancelled state is the default one the core passes
+/// (cancelled when the target world is not the player's). The core's `can_modify_world` negates it.
+fn modify_world_final_cancelled(default_cancelled: bool) -> bool {
+    default_cancelled
+}
+
 /// The flags of a raw section write: the clients hear of it, nothing else runs (Java `setBlockState` on the section,
 /// then `blockChanged`).
 const RAW_WRITE_BITS: u32 = 2 | 16 | 32 | 256 | 512;
@@ -1836,7 +1842,7 @@ impl SetBlockHost for AxiomHost<'_> {
         world_filters_pass(&self.config, dim)
     }
     fn modify_world_event(&mut self, _player: u128, _dim: &str, cancelled: bool) -> bool {
-        !cancelled
+        modify_world_final_cancelled(cancelled)
     }
     fn max_chunk_load_distance(&self, _dim: &str) -> i32 {
         self.config.max_chunk_load_distance_for(false)
@@ -3330,6 +3336,13 @@ mod tests {
 #[cfg(test)]
 mod block_state_tests {
     use super::*;
+
+    #[test]
+    fn the_modify_world_event_keeps_its_default_cancelled_state() {
+        // The player's own world: not cancelled, so the edit is allowed. Another world: cancelled.
+        assert!(!modify_world_final_cancelled(false));
+        assert!(modify_world_final_cancelled(true));
+    }
 
     #[test]
     fn update_flags_map_the_java_bits() {
