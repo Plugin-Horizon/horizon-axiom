@@ -95,3 +95,4 @@ Audit fixes
 - Fixed: chunk holds use the ticket controller `axiom:chunks` (`set_mod_forced`), old tickets are released once at start.
 - Permission nodes: see above, declared in `Mod::permission_gather_nodes`.
 - Gaps: HMOD-GAP(permission-explicit-deny): typed query cannot tell deny from unset; wildcard nodes cannot be queried; `block_state_from_wire` still refuses every state (set_block / set_buffer write nothing until the engine has numeric state ids; not runtime-tested here).
+- Round 8 (2026-11-26): no-trigger plates and tripwires (`pressure_plate_change_detail`, `tripwire_trigger`), detached hanging facing (`hanging_nbt_*`); ENGINE_NEEDS `pressure_plate_entities`, `entity_hanging_detached` closed. Item list 26/26.

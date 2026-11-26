@@ -25,6 +25,7 @@ use crate::horizon_axiom_core::custom::{
 };
 use crate::horizon_axiom_core::entity::{self, EntityHost, EntityTypeFilter, HiddenEntities, Pos, Turn};
 use crate::horizon_axiom_core::regex::full_match;
+use crate::horizon_axiom_core::setblock::physical::NoPhysicalTrigger;
 use crate::horizon_axiom_core::request::{
     self, EntityInfo, RequestChunksOperation, RequestHost, SectionRead,
 };
@@ -48,7 +49,7 @@ use crate::horizon_axiom_core::world::{
 use crate::block_ids::{BlockTable, RegistryBlock};
 use mod_api::{
     BlockMetadata, BlockState as HostState, BlockUpdateFlags, Direction, EntityChangeBlockPreEvent, HostBlockStates, MoveFail,
-    LoopContext, PlayerMoveCheckEvent, StateConstraint, VanillaGameEventEvent,
+    LoopContext, LevelHost, PlayerMoveCheckEvent, PressurePlateChangeDetailEvent, TripwireTriggerEvent, StateConstraint, VanillaGameEventEvent,
     ChunkRef, Command, CommandArgumentValue, Compound, Config, ConfigFile, ConfigKind,
     ConfigLoadingEvent, ConfigReloadingEvent, EntityRef, Flow, GameMode, GameRuleValue, Hooks,
     HostSide, LevelRef, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode,
@@ -128,6 +129,33 @@ fn verify_block_ids(host: &dyn ServerHost) {
         texts[id as usize] = text;
     }
     let _ = EXACT_STATES.set(texts);
+}
+
+/// The clockwise quarter turns of a `Turn`.
+fn quarter_of(turn: Turn) -> i32 {
+    match turn {
+        Turn::None => 0,
+        Turn::Clockwise90 => 1,
+        Turn::Clockwise180 => 2,
+        Turn::CounterClockwise90 => 3,
+    }
+}
+
+/// `ItemRotation` of a saved item frame (a byte; missing is 0).
+fn item_rotation_of(data: &Nbt) -> i32 {
+    match data {
+        Nbt::Compound(map) => match map.get("ItemRotation") {
+            Some(Nbt::Byte(v)) => i32::from(*v),
+            Some(Nbt::Int(v)) => *v,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// `rotation - delta`, wrapped to eighths of a turn.
+fn wrap_item_rotation(current: i32, delta: i32) -> u8 {
+    (current - delta).rem_euclid(8) as u8
 }
 
 /// `Direction.getClockWise` applied `quarter` times: a horizontal facing turns, up and down stay.
@@ -1268,6 +1296,55 @@ impl<'a> AxiomHost<'a> {
             .find(|tree| tree.nodes.iter().any(|node| node.uuid == uuid))
     }
 
+    /// The saved data and kind of an entity of a detached tree.
+    fn detached_node(&self, uuid: u128) -> Option<(String, Compound)> {
+        let node = self.pending_tree(uuid)?.nodes.iter().find(|node| node.uuid == uuid)?;
+        let Nbt::Compound(map) = &node.data else { return None };
+        let Some(Nbt::String(kind)) = map.get("id") else { return None };
+        let Tag::Compound(compound) = core_to_tag(&node.data) else { return None };
+        Some((kind.clone(), compound))
+    }
+
+    /// The facing of an unspawned item frame or painting (`hanging_nbt_direction`), read from its saved data.
+    fn detached_facing(&self, uuid: u128) -> Option<Direction> {
+        let (kind, data) = self.detached_node(uuid)?;
+        self.host.hanging_nbt_direction(&kind, &data)
+    }
+
+    /// `HangingEntity.rotate` on a detached entity: `hanging_nbt_set_direction` writes the turned facing into its data.
+    fn turn_detached_hanging(&mut self, uuid: u128, quarter: i32) {
+        let Some((kind, data)) = self.detached_node(uuid) else { return };
+        let Some(facing) = self.host.hanging_nbt_direction(&kind, &data) else { return };
+        let turned = turn_clockwise(facing, quarter);
+        if turned == facing {
+            return;
+        }
+        let Some(turned_data) = self.host.hanging_nbt_set_direction(&kind, data, turned) else { return };
+        self.store_detached(uuid, &turned_data);
+    }
+
+    /// `itemFrame.setRotation(rotation - delta)` on a detached frame (`hanging_nbt_set_item_rotation`).
+    fn turn_detached_item(&mut self, uuid: u128, delta: i32) {
+        let Some((kind, data)) = self.detached_node(uuid) else { return };
+        let current = item_rotation_of(&tag_to_core(&Tag::Compound(data.clone())));
+        let Some(turned_data) = self.host.hanging_nbt_set_item_rotation(&kind, data, wrap_item_rotation(current, delta)) else {
+            return;
+        };
+        self.store_detached(uuid, &turned_data);
+    }
+
+    fn store_detached(&mut self, uuid: u128, data: &Compound) {
+        let nbt = tag_to_core(&Tag::Compound(data.clone()));
+        if let Some(node) = self
+            .pending
+            .values_mut()
+            .flat_map(|tree| tree.nodes.iter_mut())
+            .find(|node| node.uuid == uuid)
+        {
+            node.data = nbt;
+        }
+    }
+
     /// The block entity at `pos` as `saveWithId` writes it: its data with `id` and the position.
     fn saved_block_entity(&mut self, dim: &str, pos: [i32; 3]) -> Option<Nbt> {
         let level = self.level(dim)?;
@@ -2115,6 +2192,9 @@ impl EntityHost for AxiomHost<'_> {
         !self.entities.contains_key(&uuid)
     }
     fn item_frame_on_y_axis(&self, uuid: u128) -> bool {
+        if let Some(facing) = self.detached_facing(uuid) {
+            return matches!(facing, Direction::Up | Direction::Down);
+        }
         self.entity_of(uuid)
             .and_then(|e| e.hanging_direction(&*self.host))
             .is_some_and(|d| matches!(d, Direction::Up | Direction::Down))
@@ -2140,16 +2220,15 @@ impl EntityHost for AxiomHost<'_> {
         Some(node)
     }
     fn set_hanging_turn(&mut self, uuid: u128, turn: Turn) {
-        // `HangingEntity.rotate`: a facing on the Y axis stays, a horizontal one turns clockwise by `turn`. An entity
-        // the core built but did not add (a pending tree) has no engine entity yet and is left as it is.
+        // `HangingEntity.rotate`: a facing on the Y axis stays, a horizontal one turns clockwise by `turn`.
+        let quarter = quarter_of(turn);
+        if self.pending_tree(uuid).is_some() {
+            // An entity of a tree the core built but did not add has no engine entity: its saved facing is turned.
+            self.turn_detached_hanging(uuid, quarter);
+            return;
+        }
         let Some(entity) = self.entity_of(uuid) else { return };
         let Some(facing) = entity.hanging_direction(&*self.host) else { return };
-        let quarter = match turn {
-            Turn::None => 0,
-            Turn::Clockwise90 => 1,
-            Turn::Clockwise180 => 2,
-            Turn::CounterClockwise90 => 3,
-        };
         let turned = turn_clockwise(facing, quarter);
         if turned != facing {
             let _ = entity.set_hanging_direction(&mut *self.host, turned);
@@ -2157,6 +2236,10 @@ impl EntityHost for AxiomHost<'_> {
     }
     fn adjust_item_frame_rotation(&mut self, uuid: u128, delta: i32) {
         // `itemFrame.setRotation(itemFrame.getRotation() - delta)`, wrapped to eighths of a turn.
+        if self.pending_tree(uuid).is_some() {
+            self.turn_detached_item(uuid, delta);
+            return;
+        }
         let Some(entity) = self.entity_of(uuid) else { return };
         let Some(current) = entity.item_frame_rotation(&*self.host) else { return };
         let _ = entity.set_item_frame_rotation(&mut *self.host, (i32::from(current) - delta).rem_euclid(8) as u8);
@@ -3038,11 +3121,30 @@ impl Hooks for Mod {
     }
 
     /// `NoPhysicalTriggerListener`, `PlayerInteractEvent` with `Action.PHYSICAL`: farmland and turtle eggs a no-trigger
-    /// player lands on stay as they are. (Pressure plates and tripwires: the hook names no entity, see ENGINE_NEEDS.)
+    /// player lands on stay as they are. (Pressure plates and tripwires: `pressure_plate_change_detail` and `tripwire_trigger`, below.)
     fn entity_change_block_pre(&self, _: &mut dyn ServerHost, event: &mut EntityChangeBlockPreEvent<'_>) -> Flow {
         match event.player {
             Some(player) if hook_sets(|sets| sets.no_physical.contains(&player)) => Flow::Cancel,
             _ => Flow::Continue,
+        }
+    }
+
+    /// `NoPhysicalTriggerListener`, `PlayerInteractEvent` with `Action.PHYSICAL` on a pressure plate: it stays as it was
+    /// while only no-trigger players stand on it (`NoPhysicalTrigger::cancels_plate_entities`).
+    fn pressure_plate_change_detail(&self, _: &dyn LevelHost, event: &mut PressurePlateChangeDetailEvent<'_>) -> Flow {
+        if hook_sets(|sets| NoPhysicalTrigger::cancels_plate_entities(event.entities, |e| sets.no_physical_entities.contains(&e))) {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// The same for a tripwire a no-trigger player walks into.
+    fn tripwire_trigger(&self, _: &dyn LevelHost, event: &mut TripwireTriggerEvent<'_>) -> Flow {
+        if hook_sets(|sets| NoPhysicalTrigger::cancels_plate_entities(event.entities, |e| sets.no_physical_entities.contains(&e))) {
+            Flow::Cancel
+        } else {
+            Flow::Continue
         }
     }
 
@@ -3100,6 +3202,27 @@ mod tests {
         assert!(!looks_like_image(b"\x89PNG"));
         assert!(!looks_like_image(b"name: not an image"));
         assert!(!looks_like_image(b""));
+    }
+
+    #[test]
+    fn detached_item_frame_rotation_reads_the_byte_and_wraps_to_eighths() {
+        let mut map = BTreeMap::new();
+        map.insert("ItemRotation".to_owned(), Nbt::Byte(1));
+        let data = Nbt::Compound(map);
+        assert_eq!(item_rotation_of(&data), 1);
+        assert_eq!(item_rotation_of(&Nbt::Compound(BTreeMap::new())), 0);
+        assert_eq!(wrap_item_rotation(item_rotation_of(&data), 2), 7);
+        assert_eq!(wrap_item_rotation(7, -2), 1);
+        assert_eq!(wrap_item_rotation(0, 4), 4);
+    }
+
+    #[test]
+    fn turns_are_clockwise_quarters() {
+        assert_eq!(quarter_of(Turn::Clockwise90), 1);
+        assert_eq!(quarter_of(Turn::Clockwise180), 2);
+        assert_eq!(quarter_of(Turn::CounterClockwise90), 3);
+        assert_eq!(turn_clockwise(Direction::North, quarter_of(Turn::Clockwise90)), Direction::East);
+        assert_eq!(turn_clockwise(Direction::Up, 1), Direction::Up);
     }
 
     #[test]
